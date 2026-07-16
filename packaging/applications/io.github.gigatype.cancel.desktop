@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cancel GigaType Recording
+Comment=Discard the current private voice recording
+Exec=gigatype cancel
+Icon=process-stop
+Terminal=false
+NoDisplay=true
+Categories=Utility;Accessibility;
+X-KDE-Shortcuts=Shift+F9

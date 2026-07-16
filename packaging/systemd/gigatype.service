@@ -6,6 +6,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/gigatype daemon
+ExecStopPost=/usr/bin/rm -f %t/gigatype-recording.wav
 Restart=on-failure
 RestartSec=2
 Environment=HF_HUB_OFFLINE=1

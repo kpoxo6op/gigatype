@@ -10,12 +10,12 @@ MODEL=${HOME}/.local/share/russian-asr/gigaam-multilingual-ctc/pytorch_model.bin
 PYTHON=${HOME}/.local/share/russian-asr/venv/bin/python
 
 missing=()
-for command in cargo ffmpeg ffprobe pw-record pw-play qdbus6 notify-send python3 sudo systemctl udevadm; do
+for command in cargo ffmpeg ffprobe pw-record pw-play qdbus6 gdbus notify-send python3 sudo systemctl udevadm; do
   command -v "$command" >/dev/null 2>&1 || missing+=("$command")
 done
 if (( ${#missing[@]} )); then
   echo "Missing required commands: ${missing[*]}" >&2
-  echo "Debian/Ubuntu packages: cargo rustfmt ffmpeg pipewire-bin qdbus-qt6 libnotify-bin python3 python3-venv" >&2
+  echo "Debian/Ubuntu packages: cargo rustfmt ffmpeg pipewire-bin qdbus-qt6 libglib2.0-bin libnotify-bin python3 python3-venv" >&2
   exit 1
 fi
 
@@ -51,6 +51,25 @@ else
   echo "F9 is already used, so no shortcut was taken." >&2
 fi
 
+cancel_shortcut_available=true
+if command -v qdbus6 >/dev/null 2>&1; then
+  cancel_shortcut_available=$(qdbus6 org.kde.kglobalaccel /kglobalaccel \
+    org.kde.KGlobalAccel.isGlobalShortcutAvailable 50331704 io.github.gigatype.cancel.desktop 2>/dev/null || true)
+  cancel_shortcut_owner=$(qdbus6 org.kde.kglobalaccel /kglobalaccel \
+    org.kde.KGlobalAccel.action 50331704 2>/dev/null | head -n 1 || true)
+  if [[ "$cancel_shortcut_owner" == "io.github.gigatype.cancel.desktop" ]]; then
+    cancel_shortcut_available=true
+  fi
+fi
+if [[ "$cancel_shortcut_available" == "true" ]]; then
+  install -m 0644 packaging/applications/io.github.gigatype.cancel.desktop \
+    "$APP_DIR/io.github.gigatype.cancel.desktop"
+else
+  sed '/^X-KDE-Shortcuts=/d' packaging/applications/io.github.gigatype.cancel.desktop \
+    >"$APP_DIR/io.github.gigatype.cancel.desktop"
+  echo "Shift+F9 is already used, so no cancel shortcut was taken." >&2
+fi
+
 if command -v sudo >/dev/null 2>&1; then
   rule=$(mktemp)
   trap 'rm -f "$rule"' EXIT
@@ -75,5 +94,5 @@ for _ in {1..50}; do
 done
 
 echo
-echo "GigaType is installed. Press F9 to start, then F9 again to transcribe and type."
+echo "GigaType is installed. Press F9 to start/stop, or Shift+F9 to cancel."
 echo "Run 'gigatype doctor' for a health check."
