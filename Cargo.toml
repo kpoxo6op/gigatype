@@ -1,6 +1,6 @@
 [package]
 name = "gigatype"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Fast local Russian voice typing powered by GigaAM"
 license = "MIT"

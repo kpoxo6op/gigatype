@@ -5,3 +5,5 @@ omegaconf>=2.3,<3
 numpy>=2,<3
 soundfile>=0.13,<1
 sentencepiece>=0.2,<1
+# Transformers scans GigaAM's optional type-only import when loading remote code.
+pyannote-core>=6,<7

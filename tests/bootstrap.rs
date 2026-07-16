@@ -24,3 +24,19 @@ fn bootstrap_can_explain_the_install_without_downloading() {
         "print-plan must not alter the filesystem"
     );
 }
+
+#[test]
+fn model_dependencies_include_the_transformers_pyannote_namespace() {
+    let requirements = std::fs::read_to_string(format!(
+        "{}/requirements-model.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+
+    assert!(
+        requirements
+            .lines()
+            .any(|line| line.starts_with("pyannote-core")),
+        "Transformers checks the optional pyannote namespace while loading GigaAM"
+    );
+}
