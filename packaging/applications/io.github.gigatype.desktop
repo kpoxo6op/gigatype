@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GigaType Russian Dictation
+Comment=Toggle private local Russian voice typing
+Exec=gigatype toggle
+Icon=audio-input-microphone
+Terminal=false
+NoDisplay=true
+Categories=Utility;Accessibility;
+X-KDE-Shortcuts=F9

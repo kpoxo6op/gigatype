@@ -1,0 +1,5 @@
+/target/
+*.wav
+*.log
+__pycache__/
+*.pyc

@@ -1,0 +1,15 @@
+[Unit]
+Description=GigaType local Russian voice typing
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gigatype daemon
+Restart=on-failure
+RestartSec=2
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HOME=%h/.local/share/russian-asr/models
+
+[Install]
+WantedBy=default.target

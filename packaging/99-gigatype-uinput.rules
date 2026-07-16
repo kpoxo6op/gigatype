@@ -1,0 +1,2 @@
+# Permit only the desktop user selected by install.sh to use the virtual keyboard.
+KERNEL=="uinput", SUBSYSTEM=="misc", OWNER="@USER@", MODE="0600", OPTIONS+="static_node=uinput"
