@@ -5,14 +5,15 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 APP_DIR=${HOME}/.local/share/russian-asr
 VENV=${APP_DIR}/venv
 PYTHON=${VENV}/bin/python
-MODEL_DIR=${APP_DIR}/gigaam-multilingual-ctc
-MODEL_ID=ai-sage/GigaAM-Multilingual
-MODEL_REVISION=ctc
+MODEL_DIR=${APP_DIR}/gigaam-v3-e2e-rnnt
+MODEL_ID=ai-sage/GigaAM-v3
+MODEL_REVISION=e2e_rnnt
 
 if [[ "${1:-}" == "--print-plan" ]]; then
   echo "model=${MODEL_ID}@${MODEL_REVISION}"
   echo "python=${VENV}"
   echo "model_dir=${MODEL_DIR}"
+  echo "files=config.json,modeling_gigaam.py,pytorch_model.bin,tokenizer.model"
   exit 0
 fi
 
@@ -48,15 +49,20 @@ snapshot_download(
     repo_id=os.environ["MODEL_ID"],
     revision=os.environ["MODEL_REVISION"],
     local_dir=os.environ["MODEL_DIR"],
-    allow_patterns=["config.json", "modeling_gigaam.py", "pytorch_model.bin"],
+    allow_patterns=[
+        "config.json",
+        "modeling_gigaam.py",
+        "pytorch_model.bin",
+        "tokenizer.model",
+    ],
 )
 PY
 
-for file in config.json modeling_gigaam.py pytorch_model.bin; do
+for file in config.json modeling_gigaam.py pytorch_model.bin tokenizer.model; do
   if [[ ! -s "$MODEL_DIR/$file" ]]; then
     echo "Model download is incomplete: $MODEL_DIR/$file is missing" >&2
     exit 1
   fi
 done
 
-echo "GigaAM Multilingual is ready."
+echo "GigaAM v3 end-to-end RNN-T is ready."

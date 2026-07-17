@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -8,9 +8,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use wl_clipboard_rs::{copy, paste};
 
 const HELP: &str = "GigaType — local Russian voice typing with GigaAM
 
@@ -171,7 +172,105 @@ enum DictationState {
     Recording {
         child: Option<Child>,
         audio_path: PathBuf,
+        started_at: Instant,
+        media: MediaGuard,
+        can_fallback_microphone: bool,
     },
+}
+
+struct MediaGuard {
+    paused_services: Vec<String>,
+}
+
+impl MediaGuard {
+    fn pause_playing() -> Self {
+        if let Some(path) = env::var_os("GIGATYPE_MEDIA_LOG") {
+            let _ = fs::write(path, "pause\n");
+            return Self {
+                paused_services: vec!["fake".into()],
+            };
+        }
+        if env::var_os("GIGATYPE_KEEP_MEDIA_PLAYING").is_some() {
+            return Self {
+                paused_services: Vec::new(),
+            };
+        }
+        let output = Command::new("qdbus6").output();
+        let mut paused_services = Vec::new();
+        if let Ok(output) = output {
+            for service in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("org.mpris.MediaPlayer2."))
+            {
+                let status = Command::new("gdbus")
+                    .args([
+                        "call",
+                        "--session",
+                        "--dest",
+                        service,
+                        "--object-path",
+                        "/org/mpris/MediaPlayer2",
+                        "--method",
+                        "org.freedesktop.DBus.Properties.Get",
+                        "org.mpris.MediaPlayer2.Player",
+                        "PlaybackStatus",
+                    ])
+                    .output();
+                let is_playing = status.is_ok_and(|status| {
+                    status.status.success()
+                        && String::from_utf8_lossy(&status.stdout).contains("Playing")
+                });
+                if is_playing
+                    && Command::new("gdbus")
+                        .args([
+                            "call",
+                            "--session",
+                            "--dest",
+                            service,
+                            "--object-path",
+                            "/org/mpris/MediaPlayer2",
+                            "--method",
+                            "org.mpris.MediaPlayer2.Player.Pause",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                {
+                    paused_services.push(service.to_string());
+                }
+            }
+        }
+        Self { paused_services }
+    }
+
+    fn resume(self) {
+        if let Some(path) = env::var_os("GIGATYPE_MEDIA_LOG") {
+            if !self.paused_services.is_empty() {
+                if let Ok(mut file) = OpenOptions::new().append(true).open(path) {
+                    let _ = writeln!(file, "resume");
+                }
+            }
+            return;
+        }
+        for service in self.paused_services {
+            let _ = Command::new("gdbus")
+                .args([
+                    "call",
+                    "--session",
+                    "--dest",
+                    &service,
+                    "--object-path",
+                    "/org/mpris/MediaPlayer2",
+                    "--method",
+                    "org.mpris.MediaPlayer2.Player.Play",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 enum SoundCue {
@@ -229,26 +328,101 @@ fn notify(summary: &str, body: &str) {
         .spawn();
 }
 
+fn spawn_recorder(audio_path: &Path, target: Option<&str>) -> Result<Child, String> {
+    let recorder = env::var_os("GIGATYPE_RECORDER").unwrap_or_else(|| "pw-record".into());
+    let mut command = Command::new(recorder);
+    command.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
+    if let Some(target) = target {
+        command.args(["--target", target]);
+    }
+    command
+        .arg(audio_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not start microphone recording: {error}"))
+}
+
 fn start_recording() -> Result<DictationState, String> {
     let audio_path = runtime_dir().join("gigatype-recording.wav");
     let _ = fs::remove_file(&audio_path);
+    let media = MediaGuard::pause_playing();
     play_sound(SoundCue::Listening);
-    let child = if env::var_os("GIGATYPE_FAKE_RECORDING").is_some() {
+    let (child, can_fallback_microphone) = if env::var_os("GIGATYPE_FAKE_RECORDING").is_some() {
         fs::write(&audio_path, b"fake audio").map_err(|error| error.to_string())?;
-        None
+        (None, false)
     } else {
-        Some(
-            Command::new("pw-record")
-                .args(["--rate", "16000", "--channels", "1", "--format", "s16"])
-                .arg(&audio_path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|error| format!("could not start microphone recording: {error}"))?,
-        )
+        let preferred = env::var("GIGATYPE_MICROPHONE").ok();
+        let mut process = match spawn_recorder(&audio_path, preferred.as_deref()) {
+            Ok(process) => process,
+            Err(error) => {
+                media.resume();
+                return Err(error);
+            }
+        };
+        if preferred.is_some() {
+            thread::sleep(Duration::from_millis(80));
+            if process
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                notify(
+                    "Microphone fallback",
+                    "Preferred microphone is unavailable; using the system default",
+                );
+                process = match spawn_recorder(&audio_path, None) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        media.resume();
+                        return Err(error);
+                    }
+                };
+                (Some(process), false)
+            } else {
+                (Some(process), true)
+            }
+        } else {
+            (Some(process), false)
+        }
     };
     notify("Listening…", "Press the shortcut again to transcribe");
-    Ok(DictationState::Recording { child, audio_path })
+    Ok(DictationState::Recording {
+        child,
+        audio_path,
+        started_at: Instant::now(),
+        media,
+        can_fallback_microphone,
+    })
+}
+
+fn recover_disconnected_microphone(state: &mut DictationState) {
+    let DictationState::Recording {
+        child: Some(process),
+        audio_path,
+        can_fallback_microphone,
+        ..
+    } = state
+    else {
+        return;
+    };
+    if !*can_fallback_microphone {
+        return;
+    }
+    let disconnected = process.try_wait().is_ok_and(|status| status.is_some());
+    if disconnected {
+        *can_fallback_microphone = false;
+        match spawn_recorder(audio_path, None) {
+            Ok(replacement) => {
+                *process = replacement;
+                notify(
+                    "Microphone changed",
+                    "Preferred microphone disconnected; recording continues on the system default",
+                );
+            }
+            Err(error) => notify("GigaType error", &error),
+        }
+    }
 }
 
 fn stop_recording(child: &mut Option<Child>, audio_path: &Path) -> Result<(), String> {
@@ -280,6 +454,53 @@ fn stop_recording(child: &mut Option<Child>, audio_path: &Path) -> Result<(), St
     Ok(())
 }
 
+fn audio_has_speech(audio_path: &Path) -> Result<bool, String> {
+    let bytes = fs::read(audio_path).map_err(|error| error.to_string())?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Ok(true);
+    }
+    let mut cursor = 12_usize;
+    let mut pcm_16_bit = false;
+    let mut samples = None;
+    while cursor + 8 <= bytes.len() {
+        let id = &bytes[cursor..cursor + 4];
+        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        let start = cursor + 8;
+        let end = start.saturating_add(size).min(bytes.len());
+        if id == b"fmt " && end >= start + 16 {
+            let format = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap());
+            let bits = u16::from_le_bytes(bytes[start + 14..start + 16].try_into().unwrap());
+            pcm_16_bit = format == 1 && bits == 16;
+        } else if id == b"data" {
+            samples = Some(&bytes[start..end]);
+        }
+        cursor = start.saturating_add(size + (size % 2));
+    }
+    let Some(data) = samples else {
+        return Ok(true);
+    };
+    if !pcm_16_bit || data.len() < 2 {
+        return Ok(true);
+    }
+    let threshold = env::var("GIGATYPE_SILENCE_RMS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(80.0);
+    let mut squared = 0_f64;
+    let mut loud_samples = 0_usize;
+    let mut sample_count = 0_usize;
+    for sample in data.chunks_exact(2) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]) as f64;
+        squared += value * value;
+        if value.abs() >= threshold * 4.0 {
+            loud_samples += 1;
+        }
+        sample_count += 1;
+    }
+    let rms = (squared / sample_count as f64).sqrt();
+    Ok(rms >= threshold && loud_samples * 200 >= sample_count)
+}
+
 fn save_history(text: &str) -> Result<(), String> {
     let dir = dirs_home().join(".local/share/gigatype");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
@@ -305,6 +526,9 @@ fn save_history(text: &str) -> Result<(), String> {
 }
 
 fn put_on_clipboard(text: &str) -> Result<(), String> {
+    if let Some(path) = env::var_os("GIGATYPE_FAKE_FALLBACK_CLIPBOARD") {
+        return fs::write(path, text).map_err(|error| error.to_string());
+    }
     let status = Command::new("qdbus6")
         .args([
             "org.kde.klipper",
@@ -321,23 +545,101 @@ fn put_on_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
-fn get_clipboard() -> Result<String, String> {
-    let output = Command::new("qdbus6")
-        .args([
-            "org.kde.klipper",
-            "/klipper",
-            "org.kde.klipper.klipper.getClipboardContents",
-        ])
-        .output()
-        .map_err(|error| format!("could not read KDE clipboard: {error}"))?;
-    if !output.status.success() {
-        return Err("could not read KDE clipboard".into());
+struct ClipboardEntry {
+    mime_type: String,
+    data: Vec<u8>,
+}
+
+struct ClipboardSnapshot {
+    entries: Vec<ClipboardEntry>,
+}
+
+fn append_fake_clipboard_log(line: &str) -> Result<(), String> {
+    let Some(path) = env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG") else {
+        return Ok(());
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{line}").map_err(|error| error.to_string())
+}
+
+fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
+    if env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG").is_some() {
+        let mime_types = env::var("GIGATYPE_FAKE_CLIPBOARD_MIMES").unwrap_or_default();
+        append_fake_clipboard_log(&format!("capture:{mime_types}"))?;
+        return Ok(ClipboardSnapshot {
+            entries: mime_types
+                .split(',')
+                .filter(|mime| !mime.is_empty())
+                .map(|mime_type| ClipboardEntry {
+                    mime_type: mime_type.to_string(),
+                    data: Vec::new(),
+                })
+                .collect(),
+        });
     }
-    let mut text = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-    if text.ends_with('\n') {
-        text.pop();
+
+    let mime_types = match paste::get_mime_types_ordered(
+        paste::ClipboardType::Regular,
+        paste::Seat::Unspecified,
+    ) {
+        Ok(mime_types) => mime_types,
+        Err(paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => Vec::new(),
+        Err(error) => return Err(format!("could not inspect the Wayland clipboard: {error}")),
+    };
+    let mut entries = Vec::with_capacity(mime_types.len());
+    for mime_type in mime_types {
+        let (mut pipe, _) = paste::get_contents(
+            paste::ClipboardType::Regular,
+            paste::Seat::Unspecified,
+            paste::MimeType::Specific(&mime_type),
+        )
+        .map_err(|error| format!("could not preserve clipboard type {mime_type}: {error}"))?;
+        let mut data = Vec::new();
+        pipe.read_to_end(&mut data)
+            .map_err(|error| format!("could not preserve clipboard type {mime_type}: {error}"))?;
+        entries.push(ClipboardEntry { mime_type, data });
     }
-    Ok(text)
+    Ok(ClipboardSnapshot { entries })
+}
+
+fn restore_clipboard(snapshot: ClipboardSnapshot) -> Result<(), String> {
+    if env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG").is_some() {
+        let mime_types = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.mime_type.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        return append_fake_clipboard_log(&format!("restore:{mime_types}"));
+    }
+    if snapshot.entries.is_empty() {
+        return copy::clear(copy::ClipboardType::Regular, copy::Seat::All)
+            .map_err(|error| format!("could not restore an empty Wayland clipboard: {error}"));
+    }
+    let sources = snapshot
+        .entries
+        .into_iter()
+        .map(|entry| copy::MimeSource {
+            source: copy::Source::Bytes(entry.data.into_boxed_slice()),
+            mime_type: copy::MimeType::Specific(entry.mime_type),
+        })
+        .collect();
+    let mut options = copy::Options::new();
+    options.omit_additional_text_mime_types(true);
+    copy::copy_multi(options, sources)
+        .map_err(|error| format!("could not restore the Wayland clipboard: {error}"))
+}
+
+fn set_transcript_clipboard(text: &str) -> Result<(), String> {
+    if env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG").is_some() {
+        append_fake_clipboard_log("set:text/plain;charset=utf-8")?;
+        return Ok(());
+    }
+    put_on_clipboard(text)
 }
 
 #[repr(C)]
@@ -399,13 +701,87 @@ fn emit_sync(file: &mut fs::File) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Copy, Clone)]
+enum PasteChord {
+    CtrlV,
+    CtrlShiftV,
+    ShiftInsert,
+}
+
+impl PasteChord {
+    fn from_env() -> Result<Self, String> {
+        match env::var("GIGATYPE_PASTE_KEYS")
+            .unwrap_or_else(|_| "ctrl+v".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "ctrl+v" => Ok(Self::CtrlV),
+            "ctrl+shift+v" => Ok(Self::CtrlShiftV),
+            "shift+insert" => Ok(Self::ShiftInsert),
+            value => Err(format!(
+                "unsupported paste keys {value:?}; use ctrl+v, ctrl+shift+v, or shift+insert"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::CtrlV => "ctrl+v",
+            Self::CtrlShiftV => "ctrl+shift+v",
+            Self::ShiftInsert => "shift+insert",
+        }
+    }
+
+    fn events(self) -> &'static [(u16, i32)] {
+        const KEY_LEFTCTRL: u16 = 29;
+        const KEY_LEFTSHIFT: u16 = 42;
+        const KEY_V: u16 = 47;
+        const KEY_INSERT: u16 = 110;
+        match self {
+            Self::CtrlV => &[(KEY_LEFTCTRL, 1), (KEY_V, 1), (KEY_V, 0), (KEY_LEFTCTRL, 0)],
+            Self::CtrlShiftV => &[
+                (KEY_LEFTCTRL, 1),
+                (KEY_LEFTSHIFT, 1),
+                (KEY_V, 1),
+                (KEY_V, 0),
+                (KEY_LEFTSHIFT, 0),
+                (KEY_LEFTCTRL, 0),
+            ],
+            Self::ShiftInsert => &[
+                (KEY_LEFTSHIFT, 1),
+                (KEY_INSERT, 1),
+                (KEY_INSERT, 0),
+                (KEY_LEFTSHIFT, 0),
+            ],
+        }
+    }
+}
+
 fn paste_shortcut(probe_only: bool) -> Result<(), String> {
     const UI_SET_EVBIT: libc::c_ulong = 0x40045564;
     const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
     const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
     const KEY_LEFTCTRL: u16 = 29;
+    const KEY_LEFTSHIFT: u16 = 42;
     const KEY_V: u16 = 47;
+    const KEY_INSERT: u16 = 110;
+
+    let chord = PasteChord::from_env()?;
+    if !probe_only && env::var_os("GIGATYPE_FAKE_INSERT_ERROR").is_some() {
+        return Err("simulated insertion failure".into());
+    }
+    if let Some(path) = env::var_os("GIGATYPE_FAKE_KEY_LOG") {
+        if !probe_only {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| error.to_string())?;
+            writeln!(file, "{}", chord.name()).map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
 
     let mut device = OpenOptions::new()
         .write(true)
@@ -416,7 +792,9 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
     for (request, value) in [
         (UI_SET_EVBIT, 1),
         (UI_SET_KEYBIT, KEY_LEFTCTRL as libc::c_int),
+        (UI_SET_KEYBIT, KEY_LEFTSHIFT as libc::c_int),
         (UI_SET_KEYBIT, KEY_V as libc::c_int),
+        (UI_SET_KEYBIT, KEY_INSERT as libc::c_int),
     ] {
         if unsafe { libc::ioctl(fd, request, value) } < 0 {
             return Err(format!(
@@ -455,7 +833,7 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
         return Ok(());
     }
     thread::sleep(Duration::from_millis(120));
-    for (code, value) in [(KEY_LEFTCTRL, 1), (KEY_V, 1), (KEY_V, 0), (KEY_LEFTCTRL, 0)] {
+    for &(code, value) in chord.events() {
         emit_key(&mut device, code, value)?;
         emit_sync(&mut device)?;
     }
@@ -465,14 +843,26 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
 }
 
 fn insert_text(text: &str) -> Result<(), String> {
-    if let Some(path) = env::var_os("GIGATYPE_FAKE_INSERT_LOG") {
-        return fs::write(path, text).map_err(|error| error.to_string());
+    if env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG").is_none() {
+        if let Some(path) = env::var_os("GIGATYPE_FAKE_INSERT_LOG") {
+            return fs::write(path, text).map_err(|error| error.to_string());
+        }
     }
-    let previous = get_clipboard()?;
-    put_on_clipboard(text)?;
-    let result = paste_shortcut(false);
-    thread::sleep(Duration::from_millis(120));
-    let restore = put_on_clipboard(&previous);
+    let previous = capture_clipboard()?;
+    set_transcript_clipboard(text)?;
+    let result = if let Some(path) = env::var_os("GIGATYPE_FAKE_INSERT_LOG") {
+        fs::write(path, text).map_err(|error| error.to_string())
+    } else {
+        paste_shortcut(false)
+    };
+    let restore_ms = env::var("GIGATYPE_CLIPBOARD_RESTORE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120)
+        .min(5000);
+    append_fake_clipboard_log(&format!("wait:{restore_ms}ms"))?;
+    thread::sleep(Duration::from_millis(restore_ms));
+    let restore = restore_clipboard(previous);
     result.and(restore)
 }
 
@@ -484,7 +874,7 @@ fn command_exists(name: &str) -> bool {
 fn doctor() {
     let model = env::var_os("GIGATYPE_MODEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/gigaam-multilingual-ctc"));
+        .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/gigaam-v3-e2e-rnnt"));
     let model_ok = model.join("pytorch_model.bin").is_file();
     println!(
         "{} GigaAM model       {}",
@@ -524,6 +914,27 @@ fn doctor() {
         }
     );
 
+    let media_ok = command_exists("gdbus") && command_exists("qdbus6");
+    println!(
+        "{} Media pause/resume MPRIS",
+        if media_ok { "✓" } else { "✗" }
+    );
+
+    let session_ok = Command::new("qdbus6")
+        .args([
+            "org.freedesktop.ScreenSaver",
+            "/ScreenSaver",
+            "org.freedesktop.ScreenSaver.GetActive",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    println!(
+        "{} Session safety     lock/suspend cleanup",
+        if session_ok { "✓" } else { "✗" }
+    );
+
     let service = send_daemon("status").unwrap_or_else(|_| "not running".into());
     println!(
         "{} Background service  {service}",
@@ -539,8 +950,19 @@ fn finish_dictation(
     worker: &mut Worker,
     mut child: Option<Child>,
     audio_path: &Path,
+    media: MediaGuard,
 ) -> Result<String, String> {
-    stop_recording(&mut child, audio_path)?;
+    let stopped = stop_recording(&mut child, audio_path);
+    media.resume();
+    stopped?;
+    if env::var_os("GIGATYPE_FAKE_RECORDING").is_none() && !audio_has_speech(audio_path)? {
+        let _ = fs::remove_file(audio_path);
+        notify(
+            "No speech detected",
+            "Recording was silent and was not transcribed",
+        );
+        return Err("no speech was detected".into());
+    }
     play_sound(SoundCue::Transcribing);
     notify("Transcribing…", "GigaAM is processing your speech locally");
     let transcription = worker.transcribe(audio_path);
@@ -566,17 +988,155 @@ fn finish_dictation(
     Ok(text)
 }
 
+fn session_is_locked() -> bool {
+    if let Some(marker) = env::var_os("GIGATYPE_FAKE_SESSION_LOCKED_FILE") {
+        return Path::new(&marker).exists();
+    }
+    if env::var_os("GIGATYPE_NO_SESSION_MONITOR").is_some() {
+        return false;
+    }
+    Command::new("qdbus6")
+        .args([
+            "org.freedesktop.ScreenSaver",
+            "/ScreenSaver",
+            "org.freedesktop.ScreenSaver.GetActive",
+        ])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+}
+
+fn boottime() -> Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } == 0 {
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    } else {
+        Duration::ZERO
+    }
+}
+
+struct SuspendDetector {
+    instant: Instant,
+    boottime: Duration,
+}
+
+impl SuspendDetector {
+    fn new() -> Self {
+        Self {
+            instant: Instant::now(),
+            boottime: boottime(),
+        }
+    }
+
+    fn resumed(&mut self) -> bool {
+        let now_instant = Instant::now();
+        let now_boottime = boottime();
+        let awake = now_instant.duration_since(self.instant);
+        let boot = now_boottime.saturating_sub(self.boottime);
+        self.instant = now_instant;
+        self.boottime = now_boottime;
+        boot.saturating_sub(awake) > Duration::from_millis(500)
+    }
+}
+
+fn discard_recording(state: &mut DictationState, notification: (&str, &str)) -> bool {
+    let DictationState::Recording {
+        mut child,
+        audio_path,
+        media,
+        ..
+    } = std::mem::replace(state, DictationState::Idle)
+    else {
+        return false;
+    };
+    if let Some(process) = &mut child {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    let _ = fs::remove_file(audio_path);
+    media.resume();
+    notify(notification.0, notification.1);
+    true
+}
+
 fn daemon() -> Result<(), String> {
     fs::create_dir_all(runtime_dir()).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(runtime_dir().join("gigatype-recording.wav"));
     let path = socket_path();
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("could not configure daemon socket: {error}"))?;
     let mut worker = Worker::start()?;
     let mut state = DictationState::Idle;
+    let mut suspend_detector = SuspendDetector::new();
+    let mut last_lock_check = Instant::now() - Duration::from_secs(1);
 
-    for incoming in listener.incoming() {
-        let mut stream = incoming.map_err(|error| error.to_string())?;
+    let max_recording = Duration::from_millis(
+        env::var("GIGATYPE_MAX_RECORDING_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120_000),
+    );
+    let debounce = Duration::from_millis(
+        env::var("GIGATYPE_DEBOUNCE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+
+    loop {
+        recover_disconnected_microphone(&mut state);
+        let resumed = suspend_detector.resumed();
+        let should_check_lock = matches!(state, DictationState::Recording { .. })
+            && last_lock_check.elapsed() >= Duration::from_millis(250);
+        let locked = should_check_lock && session_is_locked();
+        if should_check_lock {
+            last_lock_check = Instant::now();
+        }
+        if resumed || locked {
+            discard_recording(
+                &mut state,
+                (
+                    "Cancelled",
+                    "Recording removed because the session became inactive",
+                ),
+            );
+        }
+
+        let timed_out = matches!(
+            &state,
+            DictationState::Recording { started_at, .. }
+                if started_at.elapsed() >= max_recording
+        );
+        if timed_out {
+            if let DictationState::Recording {
+                child,
+                audio_path,
+                media,
+                ..
+            } = std::mem::replace(&mut state, DictationState::Idle)
+            {
+                if let Err(error) = finish_dictation(&mut worker, child, &audio_path, media) {
+                    notify("GigaType error", &error);
+                }
+            }
+        }
+
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let mut command = String::new();
         BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
             .read_line(&mut command)
@@ -587,21 +1147,13 @@ fn daemon() -> Result<(), String> {
                 DictationState::Idle => "idle".into(),
                 DictationState::Recording { .. } => "recording".into(),
             }),
-            "cancel" => match std::mem::replace(&mut state, DictationState::Idle) {
-                DictationState::Idle => Ok("idle".into()),
-                DictationState::Recording {
-                    mut child,
-                    audio_path,
-                } => {
-                    if let Some(process) = &mut child {
-                        let _ = process.kill();
-                        let _ = process.wait();
-                    }
-                    let _ = fs::remove_file(audio_path);
-                    notify("Cancelled", "Recording discarded");
-                    Ok("cancelled".into())
-                }
-            },
+            "cancel" => Ok(
+                if discard_recording(&mut state, ("Cancelled", "Recording discarded")) {
+                    "cancelled".into()
+                } else {
+                    "idle".into()
+                },
+            ),
             "toggle" => match std::mem::replace(&mut state, DictationState::Idle) {
                 DictationState::Idle => match start_recording() {
                     Ok(recording) => {
@@ -610,8 +1162,25 @@ fn daemon() -> Result<(), String> {
                     }
                     Err(error) => Err(error),
                 },
-                DictationState::Recording { child, audio_path } => {
-                    finish_dictation(&mut worker, child, &audio_path)
+                DictationState::Recording {
+                    child,
+                    audio_path,
+                    started_at,
+                    media,
+                    can_fallback_microphone,
+                } => {
+                    if started_at.elapsed() < debounce {
+                        state = DictationState::Recording {
+                            child,
+                            audio_path,
+                            started_at,
+                            media,
+                            can_fallback_microphone,
+                        };
+                        Ok("recording".into())
+                    } else {
+                        finish_dictation(&mut worker, child, &audio_path, media)
+                    }
                 }
             },
             "quit" => {
@@ -701,5 +1270,48 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wav(samples: &[i16]) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn silent_audio_is_not_sent_to_the_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), wav(&vec![0; 16_000])).unwrap();
+        assert!(!audio_has_speech(file.path()).unwrap());
+    }
+
+    #[test]
+    fn audible_audio_is_sent_to_the_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let samples = (0..16_000)
+            .map(|index| if index % 2 == 0 { 1200 } else { -1200 })
+            .collect::<Vec<_>>();
+        fs::write(file.path(), wav(&samples)).unwrap();
+        assert!(audio_has_speech(file.path()).unwrap());
     }
 }

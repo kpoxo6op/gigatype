@@ -9,9 +9,18 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import importlib.util
 
 MAX_CHUNK_SECONDS = 22.0
-DEFAULT_MODEL = Path.home() / ".local/share/russian-asr/gigaam-multilingual-ctc"
+DEFAULT_MODEL = Path.home() / ".local/share/russian-asr/gigaam-v3-e2e-rnnt"
+
+
+def model_loader_kind(model_path: Path) -> str:
+    if model_path.name == "gigaam-v3-e2e-rnnt" or (
+        model_path / "tokenizer.model"
+    ).is_file():
+        return "local-e2e-rnnt"
+    return "transformers"
 
 
 def audio_duration(path: Path) -> float:
@@ -44,12 +53,42 @@ def split_audio(path: Path, output_dir: Path) -> list[Path]:
 
 def load_model():
     import torch
-    from transformers import AutoModel
 
     model_path = Path(os.environ.get("GIGATYPE_MODEL", DEFAULT_MODEL)).expanduser()
     if not (model_path / "pytorch_model.bin").is_file():
         raise FileNotFoundError(f"GigaAM model is missing from {model_path}")
     torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+
+    if model_loader_kind(model_path) == "local-e2e-rnnt":
+        from omegaconf import OmegaConf
+
+        spec = importlib.util.spec_from_file_location(
+            "modeling_gigaam", model_path / "modeling_gigaam.py"
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load the local GigaAM v3 model code")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        config = json.loads((model_path / "config.json").read_text())
+        cfg = OmegaConf.create(config["cfg"]["model"]["cfg"])
+        cfg.decoding.model_path = str(model_path / "tokenizer.model")
+        model = module.GigaAMASR(cfg)
+        state = torch.load(
+            model_path / "pytorch_model.bin", map_location="cpu", weights_only=True
+        )
+        state = {key.removeprefix("model."): value for key, value in state.items()}
+        missing, unexpected = model.load_state_dict(state)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"GigaAM v3 weights do not match: missing={missing}, unexpected={unexpected}"
+            )
+        model.eval()
+        return model
+
+    from transformers import AutoModel
+
     model = AutoModel.from_pretrained(
         str(model_path), trust_remote_code=True, local_files_only=True
     )
@@ -70,6 +109,12 @@ def transcribe(model, path: Path) -> str:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--print-model-plan"]:
+        model_path = Path(os.environ.get("GIGATYPE_MODEL", DEFAULT_MODEL)).expanduser()
+        print(f"model={model_path}")
+        print(f"loader={model_loader_kind(model_path)}")
+        return 0
+
     fake = os.environ.get("GIGATYPE_FAKE_TRANSCRIPT")
     model = None if fake is not None else load_model()
     for line in sys.stdin:

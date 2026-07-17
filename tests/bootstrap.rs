@@ -16,9 +16,10 @@ fn bootstrap_can_explain_the_install_without_downloading() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("ai-sage/GigaAM-Multilingual@ctc"));
+    assert!(stdout.contains("ai-sage/GigaAM-v3@e2e_rnnt"));
     assert!(stdout.contains(".local/share/russian-asr/venv"));
-    assert!(stdout.contains(".local/share/russian-asr/gigaam-multilingual-ctc"));
+    assert!(stdout.contains(".local/share/russian-asr/gigaam-v3-e2e-rnnt"));
+    assert!(stdout.contains("tokenizer.model"));
     assert!(
         std::fs::read_dir(home.path()).unwrap().next().is_none(),
         "print-plan must not alter the filesystem"

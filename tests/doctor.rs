@@ -11,4 +11,6 @@ fn doctor_reports_every_runtime_layer() {
     assert!(report.contains("Microphone recorder"));
     assert!(report.contains("KDE clipboard"));
     assert!(report.contains("Auto-insert"));
+    assert!(report.contains("Media pause/resume"));
+    assert!(report.contains("Session safety"));
 }
