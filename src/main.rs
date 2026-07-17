@@ -874,7 +874,7 @@ fn command_exists(name: &str) -> bool {
 fn doctor() {
     let model = env::var_os("GIGATYPE_MODEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/gigaam-multilingual-ctc"));
+        .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/gigaam-v3-e2e-rnnt"));
     let model_ok = model.join("pytorch_model.bin").is_file();
     println!(
         "{} GigaAM model       {}",

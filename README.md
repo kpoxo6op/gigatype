@@ -4,7 +4,7 @@
 
 GigaType is a private, local Russian dictation app for KDE Plasma on Linux. Press `F9`, speak, press `F9` again, and the transcription is inserted into the focused app. Audio and text stay on the computer.
 
-It uses a fast Rust desktop daemon and keeps [GigaAM Multilingual](https://huggingface.co/ai-sage/GigaAM-Multilingual) warm in a persistent Python worker. This avoids reloading roughly 900 MB of model weights for every sentence.
+It uses a fast Rust desktop daemon and keeps [GigaAM v3 end-to-end RNN-T](https://huggingface.co/ai-sage/GigaAM-v3) warm in a persistent Python worker. The model supplies Russian punctuation, capitalization, and text normalization without reloading its weights for every sentence.
 
 ## MVP features
 
@@ -14,7 +14,7 @@ It uses a fast Rust desktop daemon and keeps [GigaAM Multilingual](https://huggi
 - lossless clipboard preservation, including images, files, HTML, and other MIME types
 - configurable `Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert` paste for GUI apps and terminals, with copy-only fallback when injection is unavailable
 - Russian spoken punctuation: `точка`, `запятая`, `вопросительный знак`, `восклицательный знак`, `двоеточие`, `точка с запятой`, `многоточие`, `новая строка`
-- automatic whitespace cleanup, sentence capitalization, and terminal punctuation
+- model-native Russian punctuation, capitalization, number formatting, and text normalization
 - persistent local GigaAM worker and recordings longer than 25 seconds split safely
 - silence rejection, preferred-microphone fallback, and automatic media pause/resume
 - double-press protection, a two-minute recording ceiling, and private-audio cleanup on lock, suspend, stop, or restart
@@ -43,7 +43,7 @@ cd gigatype
 ./scripts/install.sh
 ```
 
-On the first run, the installer creates an isolated Python environment and downloads the public `ctc` revision of GigaAM Multilingual. It then builds the release binary, starts a user service, registers `F9` only if the shortcut is free, and grants the installing user access to a narrowly scoped virtual keyboard device.
+On the first run, the installer creates an isolated Python environment and downloads the public `e2e_rnnt` revision of GigaAM v3. It then builds the release binary, starts a user service, registers `F9` only if the shortcut is free, and grants the installing user access to a narrowly scoped virtual keyboard device.
 
 To inspect the model setup without changing anything:
 

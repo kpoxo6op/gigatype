@@ -6,7 +6,9 @@ BIN_DIR=${HOME}/.local/bin
 DATA_DIR=${HOME}/.local/share/gigatype
 APP_DIR=${HOME}/.local/share/applications
 SERVICE_DIR=${HOME}/.config/systemd/user
-MODEL=${HOME}/.local/share/russian-asr/gigaam-multilingual-ctc/pytorch_model.bin
+MODEL=${HOME}/.local/share/russian-asr/gigaam-v3-e2e-rnnt/pytorch_model.bin
+MODEL_CODE=${HOME}/.local/share/russian-asr/gigaam-v3-e2e-rnnt/modeling_gigaam.py
+MODEL_TOKENIZER=${HOME}/.local/share/russian-asr/gigaam-v3-e2e-rnnt/tokenizer.model
 PYTHON=${HOME}/.local/share/russian-asr/venv/bin/python
 
 missing=()
@@ -19,7 +21,7 @@ if (( ${#missing[@]} )); then
   exit 1
 fi
 
-if [[ ! -f "$MODEL" || ! -x "$PYTHON" ]]; then
+if [[ ! -f "$MODEL" || ! -f "$MODEL_CODE" || ! -f "$MODEL_TOKENIZER" || ! -x "$PYTHON" ]]; then
   "$ROOT/scripts/bootstrap-model.sh"
 fi
 

@@ -18,3 +18,10 @@ fn stopping_the_service_removes_interrupted_private_audio() {
     assert!(service.contains("ExecStopPost="));
     assert!(service.contains("gigatype-recording.wav"));
 }
+
+#[test]
+fn installer_requires_the_complete_v3_checkpoint() {
+    let installer = repo_file("scripts/install.sh");
+    assert!(installer.contains("gigaam-v3-e2e-rnnt/tokenizer.model"));
+    assert!(installer.contains("gigaam-v3-e2e-rnnt/modeling_gigaam.py"));
+}
