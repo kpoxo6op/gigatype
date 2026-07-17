@@ -7,8 +7,12 @@ mod shortcuts;
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "linux")]
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -680,6 +684,7 @@ fn set_transcript_clipboard(text: &str) -> Result<(), String> {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct InputId {
     bustype: u16,
     vendor: u16,
@@ -688,6 +693,7 @@ struct InputId {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct UinputUserDev {
     name: [u8; 80],
     id: InputId,
@@ -699,6 +705,7 @@ struct UinputUserDev {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct InputEvent {
     time: libc::timeval,
     event_type: u16,
@@ -706,10 +713,12 @@ struct InputEvent {
     value: i32,
 }
 
+#[cfg(target_os = "linux")]
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
+#[cfg(target_os = "linux")]
 fn emit_key(file: &mut fs::File, code: u16, value: i32) -> Result<(), String> {
     let event = InputEvent {
         time: libc::timeval {
@@ -724,6 +733,7 @@ fn emit_key(file: &mut fs::File, code: u16, value: i32) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn emit_sync(file: &mut fs::File) -> Result<(), String> {
     let event = InputEvent {
         time: libc::timeval {
@@ -769,6 +779,7 @@ impl PasteChord {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn events(self) -> &'static [(u16, i32)] {
         const KEY_LEFTCTRL: u16 = 29;
         const KEY_LEFTSHIFT: u16 = 42;
@@ -795,13 +806,21 @@ impl PasteChord {
 }
 
 fn paste_shortcut(probe_only: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
     const UI_SET_EVBIT: libc::c_ulong = 0x40045564;
+    #[cfg(target_os = "linux")]
     const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;
+    #[cfg(target_os = "linux")]
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
+    #[cfg(target_os = "linux")]
     const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
+    #[cfg(target_os = "linux")]
     const KEY_LEFTCTRL: u16 = 29;
+    #[cfg(target_os = "linux")]
     const KEY_LEFTSHIFT: u16 = 42;
+    #[cfg(target_os = "linux")]
     const KEY_V: u16 = 47;
+    #[cfg(target_os = "linux")]
     const KEY_INSERT: u16 = 110;
 
     let chord = PasteChord::from_env()?;
@@ -834,28 +853,48 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
         if probe_only {
             return Ok(());
         }
+        let primary_modifier = if cfg!(target_os = "macos") {
+            Key::Meta
+        } else {
+            Key::Control
+        };
         let result = match chord {
-            PasteChord::CtrlV => enigo.key(Key::Control, Direction::Press).and_then(|_| {
+            PasteChord::CtrlV => enigo.key(primary_modifier, Direction::Press).and_then(|_| {
                 enigo
                     .key(Key::Unicode('v'), Direction::Click)
-                    .and_then(|_| enigo.key(Key::Control, Direction::Release))
+                    .and_then(|_| enigo.key(primary_modifier, Direction::Release))
             }),
-            PasteChord::CtrlShiftV => enigo.key(Key::Control, Direction::Press).and_then(|_| {
-                enigo.key(Key::Shift, Direction::Press).and_then(|_| {
-                    enigo
-                        .key(Key::Unicode('v'), Direction::Click)
-                        .and_then(|_| {
-                            enigo
-                                .key(Key::Shift, Direction::Release)
-                                .and_then(|_| enigo.key(Key::Control, Direction::Release))
-                        })
+            PasteChord::CtrlShiftV => {
+                enigo.key(primary_modifier, Direction::Press).and_then(|_| {
+                    enigo.key(Key::Shift, Direction::Press).and_then(|_| {
+                        enigo
+                            .key(Key::Unicode('v'), Direction::Click)
+                            .and_then(|_| {
+                                enigo
+                                    .key(Key::Shift, Direction::Release)
+                                    .and_then(|_| enigo.key(primary_modifier, Direction::Release))
+                            })
+                    })
                 })
-            }),
-            PasteChord::ShiftInsert => enigo.key(Key::Shift, Direction::Press).and_then(|_| {
-                enigo
-                    .key(Key::Insert, Direction::Click)
-                    .and_then(|_| enigo.key(Key::Shift, Direction::Release))
-            }),
+            }
+            PasteChord::ShiftInsert => {
+                #[cfg(target_os = "macos")]
+                {
+                    enigo.key(Key::Meta, Direction::Press).and_then(|_| {
+                        enigo
+                            .key(Key::Unicode('v'), Direction::Click)
+                            .and_then(|_| enigo.key(Key::Meta, Direction::Release))
+                    })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    enigo.key(Key::Shift, Direction::Press).and_then(|_| {
+                        enigo
+                            .key(Key::Insert, Direction::Click)
+                            .and_then(|_| enigo.key(Key::Shift, Direction::Release))
+                    })
+                }
+            }
         };
         return result.map_err(|error| format!("native paste failed: {error}"));
     }

@@ -21,9 +21,18 @@ impl Platform {
             };
         }
         #[cfg(target_os = "macos")]
-        return Self::macos();
-        #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-        return Self::bsd();
+        {
+            Self::macos()
+        }
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            Self::bsd()
+        }
         #[cfg(target_os = "linux")]
         {
             if env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -32,8 +41,19 @@ impl Platform {
             if env::var_os("DISPLAY").is_some() {
                 return Self::linux_x11();
             }
+            Self::generic_unix()
         }
-        Self::generic_unix()
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "linux"
+        )))]
+        {
+            Self::generic_unix()
+        }
     }
 
     fn linux_wayland() -> Self {
