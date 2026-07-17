@@ -2,18 +2,22 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-APP_DIR=${HOME}/.local/share/russian-asr
-VENV=${APP_DIR}/venv
-PYTHON=${VENV}/bin/python
-MODEL_DIR=${APP_DIR}/gigaam-v3-e2e-rnnt
-MODEL_ID=ai-sage/GigaAM-v3
-MODEL_REVISION=e2e_rnnt
+MODEL_DIR=${GIGATYPE_MODEL:-${HOME}/.local/share/gigatype/models/gigaam-v3-e2e-rnnt}
+MODEL_NAME=GigaType/gigaam-v3-e2e-rnnt-onnx
+MODEL_RELEASE=${GIGATYPE_MODEL_RELEASE:-model-v3-e2e-rnnt}
+MODEL_BASE_URL=${GIGATYPE_MODEL_BASE_URL:-https://github.com/kpoxo6op/gigatype/releases/download/${MODEL_RELEASE}}
+FILES=(
+  v3_e2e_rnnt_encoder.onnx
+  v3_e2e_rnnt_decoder.onnx
+  v3_e2e_rnnt_joint.onnx
+  tokenizer.model
+)
 
 if [[ "${1:-}" == "--print-plan" ]]; then
-  echo "model=${MODEL_ID}@${MODEL_REVISION}"
-  echo "python=${VENV}"
+  echo "model=${MODEL_NAME}"
+  echo "release=${MODEL_RELEASE}"
   echo "model_dir=${MODEL_DIR}"
-  echo "files=config.json,modeling_gigaam.py,pytorch_model.bin,tokenizer.model"
+  echo "files=$(IFS=,; echo "${FILES[*]}")"
   exit 0
 fi
 
@@ -22,47 +26,43 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required. On Debian/Ubuntu: sudo apt install python3 python3-venv" >&2
-  exit 1
-fi
-
-echo "Preparing an isolated Python environment in $VENV"
-mkdir -p "$APP_DIR"
-if [[ ! -x "$PYTHON" ]]; then
-  python3 -m venv "$VENV"
-fi
-
-"$PYTHON" -m pip install --upgrade pip wheel
-"$PYTHON" -m pip install \
-  --index-url https://download.pytorch.org/whl/cpu \
-  'torch==2.10.*' 'torchaudio==2.10.*'
-"$PYTHON" -m pip install -r "$ROOT/requirements-model.txt"
-
-echo "Downloading ${MODEL_ID}@${MODEL_REVISION} to $MODEL_DIR"
-MODEL_DIR="$MODEL_DIR" MODEL_ID="$MODEL_ID" MODEL_REVISION="$MODEL_REVISION" \
-  "$PYTHON" - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id=os.environ["MODEL_ID"],
-    revision=os.environ["MODEL_REVISION"],
-    local_dir=os.environ["MODEL_DIR"],
-    allow_patterns=[
-        "config.json",
-        "modeling_gigaam.py",
-        "pytorch_model.bin",
-        "tokenizer.model",
-    ],
-)
-PY
-
-for file in config.json modeling_gigaam.py pytorch_model.bin tokenizer.model; do
-  if [[ ! -s "$MODEL_DIR/$file" ]]; then
-    echo "Model download is incomplete: $MODEL_DIR/$file is missing" >&2
+for command in curl sha256sum; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "$command is required to install the model" >&2
     exit 1
   fi
 done
 
-echo "GigaAM v3 end-to-end RNN-T is ready."
+mkdir -p "$MODEL_DIR"
+tmp=$(mktemp -d "${MODEL_DIR}.download.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+for file in "${FILES[@]}"; do
+  if [[ -s "$MODEL_DIR/$file" ]]; then
+    continue
+  fi
+  echo "Downloading $file"
+  curl --fail --location --retry 3 --continue-at - \
+    --output "$tmp/$file" "$MODEL_BASE_URL/$file"
+done
+
+while read -r expected file; do
+  if [[ -f "$tmp/$file" ]]; then
+    actual=$(sha256sum "$tmp/$file" | cut -d' ' -f1)
+  elif [[ -f "$MODEL_DIR/$file" ]]; then
+    actual=$(sha256sum "$MODEL_DIR/$file" | cut -d' ' -f1)
+  else
+    echo "Model download is incomplete: $file is missing" >&2
+    exit 1
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Checksum mismatch for $file" >&2
+    exit 1
+  fi
+done <"$ROOT/packaging/model-sha256.txt"
+
+for file in "${FILES[@]}"; do
+  [[ -f "$tmp/$file" ]] && mv "$tmp/$file" "$MODEL_DIR/$file"
+done
+chmod 0644 "$MODEL_DIR"/*
+echo "GigaAM v3 end-to-end RNN-T ONNX is ready in $MODEL_DIR"

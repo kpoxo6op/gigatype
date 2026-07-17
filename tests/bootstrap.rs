@@ -16,9 +16,12 @@ fn bootstrap_can_explain_the_install_without_downloading() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("ai-sage/GigaAM-v3@e2e_rnnt"));
-    assert!(stdout.contains(".local/share/russian-asr/venv"));
-    assert!(stdout.contains(".local/share/russian-asr/gigaam-v3-e2e-rnnt"));
+    assert!(stdout.contains("GigaType/gigaam-v3-e2e-rnnt-onnx"));
+    assert!(!stdout.contains("venv"));
+    assert!(stdout.contains(".local/share/gigatype/models/gigaam-v3-e2e-rnnt"));
+    assert!(stdout.contains("v3_e2e_rnnt_encoder.onnx"));
+    assert!(stdout.contains("v3_e2e_rnnt_decoder.onnx"));
+    assert!(stdout.contains("v3_e2e_rnnt_joint.onnx"));
     assert!(stdout.contains("tokenizer.model"));
     assert!(
         std::fs::read_dir(home.path()).unwrap().next().is_none(),
@@ -27,17 +30,11 @@ fn bootstrap_can_explain_the_install_without_downloading() {
 }
 
 #[test]
-fn model_dependencies_include_the_transformers_pyannote_namespace() {
-    let requirements = std::fs::read_to_string(format!(
-        "{}/requirements-model.txt",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
-
-    assert!(
-        requirements
-            .lines()
-            .any(|line| line.starts_with("pyannote-core")),
-        "Transformers checks the optional pyannote namespace while loading GigaAM"
-    );
+fn production_tree_has_no_python_model_runtime() {
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("requirements-model.txt")
+        .exists());
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("worker/gigaam_worker.py")
+        .exists());
 }

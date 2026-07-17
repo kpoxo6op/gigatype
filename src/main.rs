@@ -1,3 +1,10 @@
+mod audio;
+mod model;
+mod platform;
+#[cfg(target_os = "linux")]
+mod portal;
+mod shortcuts;
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -6,11 +13,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+#[cfg(target_os = "linux")]
 use wl_clipboard_rs::{copy, paste};
 
 const HELP: &str = "GigaType — local Russian voice typing with GigaAM
@@ -23,6 +31,9 @@ Commands:
   status       Show whether GigaType is idle, recording, or transcribing
   daemon       Run the background service
   doctor       Check audio, model, desktop, and text-insertion support
+  microphones  List microphones and mark the system default
+  platform     Show the selected Unix platform adapters
+  authorize    Grant Wayland portal permissions for shortcuts and insertion
   transcribe-file  Transcribe an audio file without typing it
   postprocess  Format raw transcript text
   help         Show this help
@@ -73,80 +84,25 @@ fn capitalize_first(text: &str) -> String {
     }
 }
 
-#[derive(Serialize)]
-struct WorkerRequest<'a> {
-    id: u64,
-    audio_path: &'a Path,
+enum Transcriber {
+    Fake(String),
+    Native(Box<model::GigaAm>),
 }
 
-#[derive(Deserialize)]
-struct WorkerReply {
-    text: Option<String>,
-    error: Option<String>,
-}
-
-struct Worker {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
-}
-
-impl Worker {
+impl Transcriber {
     fn start() -> Result<Self, String> {
-        let python = env::var_os("GIGATYPE_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/venv/bin/python"));
-        let installed_worker = dirs_home().join(".local/share/gigatype/gigaam_worker.py");
-        let worker = env::var_os("GIGATYPE_WORKER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                if installed_worker.is_file() {
-                    installed_worker
-                } else {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("worker/gigaam_worker.py")
-                }
-            });
-        let mut child = Command::new(&python)
-            .arg(&worker)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| format!("could not start {}: {error}", worker.display()))?;
-        let stdin = child.stdin.take().ok_or("worker stdin is unavailable")?;
-        let stdout = BufReader::new(child.stdout.take().ok_or("worker stdout is unavailable")?);
-        Ok(Self {
-            _child: child,
-            stdin,
-            stdout,
-            next_id: 1,
-        })
+        match env::var("GIGATYPE_FAKE_TRANSCRIPT") {
+            Ok(text) => Ok(Self::Fake(text)),
+            Err(_) => model::GigaAm::load_default()
+                .map(Box::new)
+                .map(Self::Native),
+        }
     }
 
     fn transcribe(&mut self, audio_path: &Path) -> Result<String, String> {
-        let id = self.next_id;
-        self.next_id += 1;
-        serde_json::to_writer(&mut self.stdin, &WorkerRequest { id, audio_path })
-            .map_err(|error| error.to_string())?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|error| error.to_string())?;
-        self.stdin.flush().map_err(|error| error.to_string())?;
-
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        if line.is_empty() {
-            return Err("GigaAM worker exited without a reply".into());
-        }
-        let reply: WorkerReply = serde_json::from_str(&line)
-            .map_err(|error| format!("invalid reply from GigaAM worker: {error}"))?;
-        match (reply.text, reply.error) {
-            (Some(text), _) => Ok(text),
-            (_, Some(error)) => Err(error),
-            _ => Err("GigaAM worker returned an empty reply".into()),
+        match self {
+            Self::Fake(text) => Ok(text.clone()),
+            Self::Native(model) => model.transcribe_file(audio_path),
         }
     }
 }
@@ -170,12 +126,18 @@ fn socket_path() -> PathBuf {
 enum DictationState {
     Idle,
     Recording {
-        child: Option<Child>,
+        recorder: RecorderHandle,
         audio_path: PathBuf,
         started_at: Instant,
         media: MediaGuard,
         can_fallback_microphone: bool,
     },
+}
+
+enum RecorderHandle {
+    Native(audio::Recorder),
+    Process(Child),
+    Fake,
 }
 
 struct MediaGuard {
@@ -273,6 +235,7 @@ impl MediaGuard {
     }
 }
 
+#[derive(Copy, Clone)]
 enum SoundCue {
     Listening,
     Transcribing,
@@ -300,20 +263,35 @@ fn play_sound(cue: SoundCue) {
         }
         return;
     }
-    let sound = env::var_os(variable)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(fallback));
-    if sound.is_file() {
-        let _ = Command::new("pw-play")
+    let custom = env::var_os(variable).map(PathBuf::from);
+    let sound = custom.clone().unwrap_or_else(|| PathBuf::from(fallback));
+    if custom.is_some() && sound.is_file() {
+        let player = if cfg!(target_os = "macos") {
+            "afplay"
+        } else {
+            "pw-play"
+        };
+        let _ = Command::new(player)
             .arg(sound)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    } else {
+        let _ = audio::play_cue(matches!(cue, SoundCue::Listening));
     }
 }
 
 fn notify(summary: &str, body: &str) {
     if env::var_os("GIGATYPE_NO_NOTIFY").is_some() {
+        return;
+    }
+    if cfg!(target_os = "macos") {
+        let script = format!("display notification {:?} with title {:?}", body, summary);
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
         return;
     }
     let _ = Command::new("notify-send")
@@ -348,9 +326,31 @@ fn start_recording() -> Result<DictationState, String> {
     let _ = fs::remove_file(&audio_path);
     let media = MediaGuard::pause_playing();
     play_sound(SoundCue::Listening);
-    let (child, can_fallback_microphone) = if env::var_os("GIGATYPE_FAKE_RECORDING").is_some() {
+    let (recorder, can_fallback_microphone) = if env::var_os("GIGATYPE_FAKE_RECORDING").is_some() {
         fs::write(&audio_path, b"fake audio").map_err(|error| error.to_string())?;
-        (None, false)
+        (RecorderHandle::Fake, false)
+    } else if env::var_os("GIGATYPE_RECORDER").is_none() {
+        let preferred = env::var("GIGATYPE_MICROPHONE").ok();
+        match audio::Recorder::start(preferred.as_deref()) {
+            Ok(recorder) => (RecorderHandle::Native(recorder), preferred.is_some()),
+            Err(_) if preferred.is_some() => {
+                notify(
+                    "Microphone fallback",
+                    "Preferred microphone is unavailable; using the system default",
+                );
+                match audio::Recorder::start(None) {
+                    Ok(recorder) => (RecorderHandle::Native(recorder), false),
+                    Err(error) => {
+                        media.resume();
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                media.resume();
+                return Err(error);
+            }
+        }
     } else {
         let preferred = env::var("GIGATYPE_MICROPHONE").ok();
         let mut process = match spawn_recorder(&audio_path, preferred.as_deref()) {
@@ -378,17 +378,17 @@ fn start_recording() -> Result<DictationState, String> {
                         return Err(error);
                     }
                 };
-                (Some(process), false)
+                (RecorderHandle::Process(process), false)
             } else {
-                (Some(process), true)
+                (RecorderHandle::Process(process), true)
             }
         } else {
-            (Some(process), false)
+            (RecorderHandle::Process(process), false)
         }
     };
     notify("Listening…", "Press the shortcut again to transcribe");
     Ok(DictationState::Recording {
-        child,
+        recorder,
         audio_path,
         started_at: Instant::now(),
         media,
@@ -398,7 +398,7 @@ fn start_recording() -> Result<DictationState, String> {
 
 fn recover_disconnected_microphone(state: &mut DictationState) {
     let DictationState::Recording {
-        child: Some(process),
+        recorder: RecorderHandle::Process(process),
         audio_path,
         can_fallback_microphone,
         ..
@@ -425,26 +425,30 @@ fn recover_disconnected_microphone(state: &mut DictationState) {
     }
 }
 
-fn stop_recording(child: &mut Option<Child>, audio_path: &Path) -> Result<(), String> {
-    if let Some(process) = child {
-        unsafe { libc::kill(process.id() as i32, libc::SIGINT) };
-        for _ in 0..50 {
+fn stop_recording(recorder: RecorderHandle, audio_path: &Path) -> Result<(), String> {
+    match recorder {
+        RecorderHandle::Native(recorder) => return recorder.stop(audio_path),
+        RecorderHandle::Fake => {}
+        RecorderHandle::Process(mut process) => {
+            unsafe { libc::kill(process.id() as i32, libc::SIGINT) };
+            for _ in 0..50 {
+                if process
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
             if process
                 .try_wait()
                 .map_err(|error| error.to_string())?
-                .is_some()
+                .is_none()
             {
-                break;
+                process.kill().map_err(|error| error.to_string())?;
+                process.wait().map_err(|error| error.to_string())?;
             }
-            thread::sleep(Duration::from_millis(20));
-        }
-        if process
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            process.kill().map_err(|error| error.to_string())?;
-            process.wait().map_err(|error| error.to_string())?;
         }
     }
     let size = fs::metadata(audio_path).map(|m| m.len()).unwrap_or(0);
@@ -536,13 +540,15 @@ fn put_on_clipboard(text: &str) -> Result<(), String> {
             "org.kde.klipper.klipper.setClipboardContents",
             text,
         ])
-        .status()
-        .map_err(|error| format!("could not call KDE clipboard: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("KDE clipboard rejected the transcript".into())
+        .status();
+    if status.is_ok_and(|status| status.success()) {
+        return Ok(());
     }
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("could not open the desktop clipboard: {error}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|error| format!("could not set the desktop clipboard: {error}"))
 }
 
 struct ClipboardEntry {
@@ -582,27 +588,43 @@ fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
         });
     }
 
-    let mime_types = match paste::get_mime_types_ordered(
-        paste::ClipboardType::Regular,
-        paste::Seat::Unspecified,
-    ) {
-        Ok(mime_types) => mime_types,
-        Err(paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => Vec::new(),
-        Err(error) => return Err(format!("could not inspect the Wayland clipboard: {error}")),
-    };
-    let mut entries = Vec::with_capacity(mime_types.len());
-    for mime_type in mime_types {
-        let (mut pipe, _) = paste::get_contents(
+    #[cfg(target_os = "linux")]
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        let mime_types = match paste::get_mime_types_ordered(
             paste::ClipboardType::Regular,
             paste::Seat::Unspecified,
-            paste::MimeType::Specific(&mime_type),
-        )
-        .map_err(|error| format!("could not preserve clipboard type {mime_type}: {error}"))?;
-        let mut data = Vec::new();
-        pipe.read_to_end(&mut data)
+        ) {
+            Ok(mime_types) => mime_types,
+            Err(paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => Vec::new(),
+            Err(error) => return Err(format!("could not inspect the Wayland clipboard: {error}")),
+        };
+        let mut entries = Vec::with_capacity(mime_types.len());
+        for mime_type in mime_types {
+            let (mut pipe, _) = paste::get_contents(
+                paste::ClipboardType::Regular,
+                paste::Seat::Unspecified,
+                paste::MimeType::Specific(&mime_type),
+            )
             .map_err(|error| format!("could not preserve clipboard type {mime_type}: {error}"))?;
-        entries.push(ClipboardEntry { mime_type, data });
+            let mut data = Vec::new();
+            pipe.read_to_end(&mut data).map_err(|error| {
+                format!("could not preserve clipboard type {mime_type}: {error}")
+            })?;
+            entries.push(ClipboardEntry { mime_type, data });
+        }
+        return Ok(ClipboardSnapshot { entries });
     }
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("could not open the desktop clipboard: {error}"))?;
+    let entries = clipboard
+        .get_text()
+        .ok()
+        .map(|text| ClipboardEntry {
+            mime_type: "text/plain;charset=utf-8".into(),
+            data: text.into_bytes(),
+        })
+        .into_iter()
+        .collect();
     Ok(ClipboardSnapshot { entries })
 }
 
@@ -616,22 +638,37 @@ fn restore_clipboard(snapshot: ClipboardSnapshot) -> Result<(), String> {
             .join(",");
         return append_fake_clipboard_log(&format!("restore:{mime_types}"));
     }
-    if snapshot.entries.is_empty() {
-        return copy::clear(copy::ClipboardType::Regular, copy::Seat::All)
-            .map_err(|error| format!("could not restore an empty Wayland clipboard: {error}"));
+    #[cfg(target_os = "linux")]
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        if snapshot.entries.is_empty() {
+            return copy::clear(copy::ClipboardType::Regular, copy::Seat::All)
+                .map_err(|error| format!("could not restore an empty Wayland clipboard: {error}"));
+        }
+        let sources = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| copy::MimeSource {
+                source: copy::Source::Bytes(entry.data.into_boxed_slice()),
+                mime_type: copy::MimeType::Specific(entry.mime_type),
+            })
+            .collect();
+        let mut options = copy::Options::new();
+        options.omit_additional_text_mime_types(true);
+        return copy::copy_multi(options, sources)
+            .map_err(|error| format!("could not restore the Wayland clipboard: {error}"));
     }
-    let sources = snapshot
+    let Some(entry) = snapshot
         .entries
         .into_iter()
-        .map(|entry| copy::MimeSource {
-            source: copy::Source::Bytes(entry.data.into_boxed_slice()),
-            mime_type: copy::MimeType::Specific(entry.mime_type),
-        })
-        .collect();
-    let mut options = copy::Options::new();
-    options.omit_additional_text_mime_types(true);
-    copy::copy_multi(options, sources)
-        .map_err(|error| format!("could not restore the Wayland clipboard: {error}"))
+        .find(|entry| entry.mime_type.starts_with("text/plain"))
+    else {
+        return Ok(());
+    };
+    let text = String::from_utf8(entry.data).map_err(|error| error.to_string())?;
+    arboard::Clipboard::new()
+        .map_err(|error| error.to_string())?
+        .set_text(text)
+        .map_err(|error| error.to_string())
 }
 
 fn set_transcript_clipboard(text: &str) -> Result<(), String> {
@@ -783,63 +820,109 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut device = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open("/dev/uinput")
-        .map_err(|error| format!("cannot type into apps via /dev/uinput: {error}"))?;
-    let fd = device.as_raw_fd();
-    for (request, value) in [
-        (UI_SET_EVBIT, 1),
-        (UI_SET_KEYBIT, KEY_LEFTCTRL as libc::c_int),
-        (UI_SET_KEYBIT, KEY_LEFTSHIFT as libc::c_int),
-        (UI_SET_KEYBIT, KEY_V as libc::c_int),
-        (UI_SET_KEYBIT, KEY_INSERT as libc::c_int),
-    ] {
-        if unsafe { libc::ioctl(fd, request, value) } < 0 {
+    #[cfg(target_os = "linux")]
+    if env::var_os("WAYLAND_DISPLAY").is_some()
+        && env::var_os("GIGATYPE_NO_PORTAL").is_none()
+        && portal::paste(chord, probe_only).is_ok()
+    {
+        return Ok(());
+    }
+
+    if cfg!(not(target_os = "linux")) || env::var_os("DISPLAY").is_some() {
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|error| format!("could not open native keyboard adapter: {error}"))?;
+        if probe_only {
+            return Ok(());
+        }
+        let result = match chord {
+            PasteChord::CtrlV => enigo.key(Key::Control, Direction::Press).and_then(|_| {
+                enigo
+                    .key(Key::Unicode('v'), Direction::Click)
+                    .and_then(|_| enigo.key(Key::Control, Direction::Release))
+            }),
+            PasteChord::CtrlShiftV => enigo.key(Key::Control, Direction::Press).and_then(|_| {
+                enigo.key(Key::Shift, Direction::Press).and_then(|_| {
+                    enigo
+                        .key(Key::Unicode('v'), Direction::Click)
+                        .and_then(|_| {
+                            enigo
+                                .key(Key::Shift, Direction::Release)
+                                .and_then(|_| enigo.key(Key::Control, Direction::Release))
+                        })
+                })
+            }),
+            PasteChord::ShiftInsert => enigo.key(Key::Shift, Direction::Press).and_then(|_| {
+                enigo
+                    .key(Key::Insert, Direction::Click)
+                    .and_then(|_| enigo.key(Key::Shift, Direction::Release))
+            }),
+        };
+        return result.map_err(|error| format!("native paste failed: {error}"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    return Err("native paste is unavailable".into());
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut device = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/uinput")
+            .map_err(|error| format!("cannot type into apps via /dev/uinput: {error}"))?;
+        let fd = device.as_raw_fd();
+        for (request, value) in [
+            (UI_SET_EVBIT, 1),
+            (UI_SET_KEYBIT, KEY_LEFTCTRL as libc::c_int),
+            (UI_SET_KEYBIT, KEY_LEFTSHIFT as libc::c_int),
+            (UI_SET_KEYBIT, KEY_V as libc::c_int),
+            (UI_SET_KEYBIT, KEY_INSERT as libc::c_int),
+        ] {
+            if unsafe { libc::ioctl(fd, request, value) } < 0 {
+                return Err(format!(
+                    "could not configure virtual keyboard: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        let mut setup = UinputUserDev {
+            name: [0; 80],
+            id: InputId {
+                bustype: 0x03,
+                vendor: 0x4749,
+                product: 0x5459,
+                version: 1,
+            },
+            ff_effects_max: 0,
+            absmax: [0; 64],
+            absmin: [0; 64],
+            absfuzz: [0; 64],
+            absflat: [0; 64],
+        };
+        let name = b"GigaType virtual keyboard";
+        setup.name[..name.len()].copy_from_slice(name);
+        device
+            .write_all(as_bytes(&setup))
+            .map_err(|error| error.to_string())?;
+        if unsafe { libc::ioctl(fd, UI_DEV_CREATE) } < 0 {
             return Err(format!(
-                "could not configure virtual keyboard: {}",
+                "could not create virtual keyboard: {}",
                 std::io::Error::last_os_error()
             ));
         }
-    }
-    let mut setup = UinputUserDev {
-        name: [0; 80],
-        id: InputId {
-            bustype: 0x03,
-            vendor: 0x4749,
-            product: 0x5459,
-            version: 1,
-        },
-        ff_effects_max: 0,
-        absmax: [0; 64],
-        absmin: [0; 64],
-        absfuzz: [0; 64],
-        absflat: [0; 64],
-    };
-    let name = b"GigaType virtual keyboard";
-    setup.name[..name.len()].copy_from_slice(name);
-    device
-        .write_all(as_bytes(&setup))
-        .map_err(|error| error.to_string())?;
-    if unsafe { libc::ioctl(fd, UI_DEV_CREATE) } < 0 {
-        return Err(format!(
-            "could not create virtual keyboard: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if probe_only {
+        if probe_only {
+            unsafe { libc::ioctl(fd, UI_DEV_DESTROY) };
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(120));
+        for &(code, value) in chord.events() {
+            emit_key(&mut device, code, value)?;
+            emit_sync(&mut device)?;
+        }
+        thread::sleep(Duration::from_millis(80));
         unsafe { libc::ioctl(fd, UI_DEV_DESTROY) };
-        return Ok(());
+        Ok(())
     }
-    thread::sleep(Duration::from_millis(120));
-    for &(code, value) in chord.events() {
-        emit_key(&mut device, code, value)?;
-        emit_sync(&mut device)?;
-    }
-    thread::sleep(Duration::from_millis(80));
-    unsafe { libc::ioctl(fd, UI_DEV_DESTROY) };
-    Ok(())
 }
 
 fn insert_text(text: &str) -> Result<(), String> {
@@ -872,20 +955,17 @@ fn command_exists(name: &str) -> bool {
 }
 
 fn doctor() {
-    let model = env::var_os("GIGATYPE_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_home().join(".local/share/russian-asr/gigaam-v3-e2e-rnnt"));
-    let model_ok = model.join("pytorch_model.bin").is_file();
+    let model = model::model_dir();
+    let model_ok = model::model_is_complete(&model);
     println!(
-        "{} GigaAM model       {}",
+        "{} Native GigaAM ONNX {}",
         if model_ok { "✓" } else { "✗" },
         model.display()
     );
 
-    let recorder_ok = command_exists("pw-record");
     println!(
-        "{} Microphone recorder pw-record",
-        if recorder_ok { "✓" } else { "✗" }
+        "✓ Native microphone   CPAL ({})",
+        cpal::default_host().id().name()
     );
 
     let clipboard_ok = Command::new("qdbus6")
@@ -899,8 +979,9 @@ fn doctor() {
         .status()
         .is_ok_and(|status| status.success());
     println!(
-        "{} KDE clipboard       Klipper D-Bus",
-        if clipboard_ok { "✓" } else { "✗" }
+        "{} Clipboard adapter  {}",
+        if clipboard_ok { "✓" } else { "✗" },
+        platform::Platform::detect().insertion
     );
 
     let insert_ok = paste_shortcut(true).is_ok();
@@ -947,12 +1028,12 @@ fn doctor() {
 }
 
 fn finish_dictation(
-    worker: &mut Worker,
-    mut child: Option<Child>,
+    transcriber: &mut Transcriber,
+    recorder: RecorderHandle,
     audio_path: &Path,
     media: MediaGuard,
 ) -> Result<String, String> {
-    let stopped = stop_recording(&mut child, audio_path);
+    let stopped = stop_recording(recorder, audio_path);
     media.resume();
     stopped?;
     if env::var_os("GIGATYPE_FAKE_RECORDING").is_none() && !audio_has_speech(audio_path)? {
@@ -965,7 +1046,7 @@ fn finish_dictation(
     }
     play_sound(SoundCue::Transcribing);
     notify("Transcribing…", "GigaAM is processing your speech locally");
-    let transcription = worker.transcribe(audio_path);
+    let transcription = transcriber.transcribe(audio_path);
     let cleanup = fs::remove_file(audio_path)
         .map_err(|error| format!("could not delete temporary recording: {error}"));
     let text = postprocess(&transcription?);
@@ -1008,13 +1089,20 @@ fn session_is_locked() -> bool {
 }
 
 fn boottime() -> Duration {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } == 0 {
-        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
-    } else {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } == 0 {
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        } else {
+            Duration::ZERO
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
         Duration::ZERO
     }
 }
@@ -1045,7 +1133,7 @@ impl SuspendDetector {
 
 fn discard_recording(state: &mut DictationState, notification: (&str, &str)) -> bool {
     let DictationState::Recording {
-        mut child,
+        recorder,
         audio_path,
         media,
         ..
@@ -1053,7 +1141,7 @@ fn discard_recording(state: &mut DictationState, notification: (&str, &str)) -> 
     else {
         return false;
     };
-    if let Some(process) = &mut child {
+    if let RecorderHandle::Process(mut process) = recorder {
         let _ = process.kill();
         let _ = process.wait();
     }
@@ -1073,7 +1161,10 @@ fn daemon() -> Result<(), String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure daemon socket: {error}"))?;
-    let mut worker = Worker::start()?;
+    let mut transcriber = Transcriber::start()?;
+    let _native_shortcuts = shortcuts::ShortcutManager::start();
+    #[cfg(target_os = "linux")]
+    portal::start_shortcut_listener();
     let mut state = DictationState::Idle;
     let mut suspend_detector = SuspendDetector::new();
     let mut last_lock_check = Instant::now() - Duration::from_secs(1);
@@ -1117,13 +1208,14 @@ fn daemon() -> Result<(), String> {
         );
         if timed_out {
             if let DictationState::Recording {
-                child,
+                recorder,
                 audio_path,
                 media,
                 ..
             } = std::mem::replace(&mut state, DictationState::Idle)
             {
-                if let Err(error) = finish_dictation(&mut worker, child, &audio_path, media) {
+                if let Err(error) = finish_dictation(&mut transcriber, recorder, &audio_path, media)
+                {
                     notify("GigaType error", &error);
                 }
             }
@@ -1163,7 +1255,7 @@ fn daemon() -> Result<(), String> {
                     Err(error) => Err(error),
                 },
                 DictationState::Recording {
-                    child,
+                    recorder,
                     audio_path,
                     started_at,
                     media,
@@ -1171,7 +1263,7 @@ fn daemon() -> Result<(), String> {
                 } => {
                     if started_at.elapsed() < debounce {
                         state = DictationState::Recording {
-                            child,
+                            recorder,
                             audio_path,
                             started_at,
                             media,
@@ -1179,7 +1271,7 @@ fn daemon() -> Result<(), String> {
                         };
                         Ok("recording".into())
                     } else {
-                        finish_dictation(&mut worker, child, &audio_path, media)
+                        finish_dictation(&mut transcriber, recorder, &audio_path, media)
                     }
                 }
             },
@@ -1234,7 +1326,8 @@ fn main() {
             eprintln!("transcribe-file requires an audio path");
             std::process::exit(2);
         };
-        let result = Worker::start().and_then(|mut worker| worker.transcribe(Path::new(path)));
+        let result = Transcriber::start()
+            .and_then(|mut transcriber| transcriber.transcribe(Path::new(path)));
         match result {
             Ok(text) => println!("{}", postprocess(&text)),
             Err(error) => {
@@ -1261,6 +1354,36 @@ fn main() {
     if args[0] == "doctor" {
         doctor();
         return;
+    }
+    if args[0] == "microphones" {
+        match audio::microphone_report() {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("GigaType: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args[0] == "platform" {
+        print!("{}", platform::Platform::detect().report());
+        return;
+    }
+    if args[0] == "authorize" {
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(error) = portal::authorize_input() {
+                eprintln!("GigaType: {error}");
+                std::process::exit(1);
+            }
+            println!("Wayland portal input access granted");
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("No portal permission is needed on this platform");
+            return;
+        }
     }
     if matches!(args[0].as_str(), "toggle" | "cancel" | "status" | "quit") {
         match send_daemon(&args[0]) {

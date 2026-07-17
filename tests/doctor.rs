@@ -7,9 +7,9 @@ fn doctor_reports_every_runtime_layer() {
         .output()
         .unwrap();
     let report = String::from_utf8_lossy(&output.stdout);
-    assert!(report.contains("GigaAM model"));
-    assert!(report.contains("Microphone recorder"));
-    assert!(report.contains("KDE clipboard"));
+    assert!(report.contains("Native GigaAM ONNX"));
+    assert!(report.contains("Native microphone"));
+    assert!(report.contains("Clipboard adapter"));
     assert!(report.contains("Auto-insert"));
     assert!(report.contains("Media pause/resume"));
     assert!(report.contains("Session safety"));

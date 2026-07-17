@@ -12,4 +12,5 @@ fn help_describes_the_voice_typing_commands() {
     assert!(stdout.contains("toggle"));
     assert!(stdout.contains("cancel"));
     assert!(stdout.contains("doctor"));
+    assert!(stdout.contains("microphones"));
 }

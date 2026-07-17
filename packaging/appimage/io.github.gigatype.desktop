@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GigaType
+Comment=Private local Russian voice typing
+Exec=gigatype
+Icon=io.github.gigatype
+Categories=Utility;Accessibility;
+Terminal=false

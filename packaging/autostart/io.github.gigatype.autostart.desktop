@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GigaType
+Comment=Private local Russian voice typing
+Exec=gigatype daemon
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

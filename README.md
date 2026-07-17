@@ -2,40 +2,39 @@
 
 [![CI](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml/badge.svg)](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml)
 
-GigaType is a private, local Russian dictation app for KDE Plasma on Linux. Press `F9`, speak, press `F9` again, and the transcription is inserted into the focused app. Audio and text stay on the computer.
+GigaType is private, local Russian voice typing for Unix desktops. Press `F9`, speak, press `F9` again, and the transcription is inserted into the focused app. Audio and text stay on your computer.
 
-It uses a fast Rust desktop daemon and keeps [GigaAM v3 end-to-end RNN-T](https://huggingface.co/ai-sage/GigaAM-v3) warm in a persistent Python worker. The model supplies Russian punctuation, capitalization, and text normalization without reloading its weights for every sentence.
+Version 0.3 runs the punctuation-aware [GigaAM v3 end-to-end RNN-T](https://huggingface.co/ai-sage/GigaAM-v3) model directly from Rust through ONNX Runtime. There is no Python environment, background model script, cloud API, account, or token.
 
-## MVP features
+## What it does
 
-- system-wide push-to-talk toggle (`F9` by default) and safe cancel shortcut (`Shift+F9`)
-- short, distinct audio cues for “listening” and “transcribing”
-- direct insertion at the current cursor on KDE Wayland
-- lossless clipboard preservation, including images, files, HTML, and other MIME types
-- configurable `Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert` paste for GUI apps and terminals, with copy-only fallback when injection is unavailable
-- Russian spoken punctuation: `точка`, `запятая`, `вопросительный знак`, `восклицательный знак`, `двоеточие`, `точка с запятой`, `многоточие`, `новая строка`
-- model-native Russian punctuation, capitalization, number formatting, and text normalization
-- persistent local GigaAM worker and recordings longer than 25 seconds split safely
-- silence rejection, preferred-microphone fallback, and automatic media pause/resume
-- double-press protection, a two-minute recording ceiling, and private-audio cleanup on lock, suspend, stop, or restart
-- desktop notifications, cancel/status commands, transcript history, and a health check
-- automatic local model setup; no account or API token required
-- no network access during transcription
+- global `F9` start/stop and `Shift+F9` cancel shortcuts
+- native CPAL microphone recording and pleasant start/stop chimes
+- Russian punctuation, capitalization, number formatting, and normalization from GigaAM v3
+- direct insertion at the current cursor with clipboard restoration
+- XDG GlobalShortcuts and RemoteDesktop portals on Wayland
+- native X11 and macOS shortcut/insertion fallbacks; Linux `/dev/uinput` as a last resort
+- automatic system-default microphone fallback
+- silence rejection, double-press protection, and a two-minute safety ceiling
+- optional media pause/resume while listening
+- private temporary-audio cleanup on completion, cancellation, lock, suspend, stop, or restart
+- local transcript history with owner-only permissions
+- checked model downloads and fully offline transcription
 
-## Requirements
+## Supported systems
 
-The current MVP targets KDE Plasma 6 on Wayland and Debian/Ubuntu-style Linux distributions. It needs approximately 2 GB for the CPU model and its isolated Python environment.
+| System | Audio | Shortcut and insertion | Autostart |
+| --- | --- | --- | --- |
+| Linux Wayland | CPAL/PipeWire or PulseAudio; ALSA fallback | XDG desktop portals; KDE GlobalAccel/uinput fallback | systemd user service |
+| Linux X11 | CPAL/PipeWire or PulseAudio; ALSA fallback | native X11 | systemd user service |
+| macOS | CPAL/CoreAudio | native macOS events | launchd |
+| FreeBSD/OpenBSD/NetBSD/DragonFly X11 | CPAL host backend | native X11 | XDG autostart |
 
-Install the system packages first:
-
-```bash
-sudo apt install cargo rustfmt ffmpeg pipewire-bin qdbus-qt6 \
-  libglib2.0-bin libnotify-bin python3 python3-venv
-```
+The release pipeline builds Linux x86-64 and both Intel and Apple Silicon macOS archives. The repository also contains AppImage, Debian, RPM, Nix, and Homebrew packaging.
 
 ## Install
 
-Clone and run the installer:
+Clone the repository and run the installer:
 
 ```bash
 git clone https://github.com/kpoxo6op/gigatype.git
@@ -43,71 +42,83 @@ cd gigatype
 ./scripts/install.sh
 ```
 
-On the first run, the installer creates an isolated Python environment and downloads the public `e2e_rnnt` revision of GigaAM v3. It then builds the release binary, starts a user service, registers `F9` only if the shortcut is free, and grants the installing user access to a narrowly scoped virtual keyboard device.
+The installer detects `apt`, `dnf`, `pacman`, FreeBSD `pkg`, or Homebrew and installs missing native build tools. It downloads the four checked GigaAM ONNX assets to `~/.local/share/gigatype/models/`, builds GigaType, configures autostart, and asks for the desktop permission needed to type at the cursor.
 
-To inspect the model setup without changing anything:
+To inspect the model download without changing the computer:
 
 ```bash
 ./scripts/bootstrap-model.sh --print-plan
 ```
 
+Distribution packages can also be built from:
+
+- `packaging/appimage/`
+- `packaging/debian/`
+- `packaging/rpm/`
+- `flake.nix`
+- `packaging/homebrew/gigatype.rb`
+
 ## Use
 
-Press `F9` once to listen and again to stop, transcribe, and insert. Press `Shift+F9` to cancel and delete the current recording without transcribing it. Useful commands:
+Press `F9` once to listen and again to stop, transcribe, and insert. Press `Shift+F9` to cancel and delete the current recording.
 
 ```bash
 gigatype toggle
 gigatype cancel
 gigatype status
 gigatype doctor
+gigatype microphones
+gigatype platform
 gigatype transcribe-file recording.wav
 ```
 
-History is stored at `~/.local/share/gigatype/history.jsonl`. Temporary microphone audio lives in the per-login runtime directory and is deleted immediately after every transcription attempt. Locking the desktop, suspending the laptop, cancelling, or stopping/restarting the service also removes an unfinished recording.
+History is stored at `~/.local/share/gigatype/history.jsonl`. Temporary microphone audio lives in the per-login runtime directory and is deleted immediately after each attempt.
 
-The cues use the desktop's short FreeDesktop device-added/device-removed sounds. To turn them off, add `Environment=GIGATYPE_NO_SOUNDS=1` to a systemd user-service override. Custom `.oga`, `.ogg`, or `.wav` files can be selected with `GIGATYPE_START_SOUND` and `GIGATYPE_STOP_SOUND`.
+### Settings
 
-### Reliability settings
-
-Settings are environment variables in a systemd user override (`systemctl --user edit gigatype.service`). Defaults work for normal KDE applications:
+These environment variables may be placed in a systemd user override, launchd plist, or desktop autostart entry:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `GIGATYPE_PASTE_KEYS` | `ctrl+v` | Use `ctrl+shift+v` or `shift+insert` for a terminal-first setup |
-| `GIGATYPE_CLIPBOARD_RESTORE_MS` | `120` | Wait before restoring every original clipboard format |
-| `GIGATYPE_MAX_RECORDING_MS` | `120000` | Stop and transcribe automatically at the duration limit |
+| `GIGATYPE_MODEL` | `~/.local/share/gigatype/models/gigaam-v3-e2e-rnnt` | Model asset directory |
+| `GIGATYPE_PASTE_KEYS` | `ctrl+v` | `ctrl+v`, `ctrl+shift+v`, or `shift+insert` |
+| `GIGATYPE_CLIPBOARD_RESTORE_MS` | `120` | Delay before restoring the previous clipboard |
+| `GIGATYPE_MAX_RECORDING_MS` | `120000` | Automatic stop and transcription limit |
 | `GIGATYPE_DEBOUNCE_MS` | `300` | Ignore accidental duplicate shortcut presses |
-| `GIGATYPE_MICROPHONE` | system default | Preferred PipeWire node name or serial; falls back safely if unavailable or disconnected |
-| `GIGATYPE_SILENCE_RMS` | `80` | PCM energy threshold below which silent recordings skip transcription |
-| `GIGATYPE_KEEP_MEDIA_PLAYING` | unset | Set to `1` to disable MPRIS pause/resume |
+| `GIGATYPE_MICROPHONE` | system default | Preferred microphone name |
+| `GIGATYPE_SILENCE_RMS` | `80` | PCM silence threshold |
+| `GIGATYPE_KEEP_MEDIA_PLAYING` | unset | Disable MPRIS pause/resume when set |
+| `GIGATYPE_NO_SOUNDS` | unset | Disable the native listening/transcribing chimes |
+| `GIGATYPE_START_SOUND` | native chime | Custom sound file played by the platform player |
+| `GIGATYPE_STOP_SOUND` | native chime | Custom sound file played by the platform player |
 
-After changing an override, run `systemctl --user daemon-reload && systemctl --user restart gigatype.service`.
+## Desktop permissions
 
-## Remove the app
+On Wayland, `gigatype authorize` requests persistent keyboard permission through the standard XDG RemoteDesktop portal. Global shortcuts are registered through the XDG GlobalShortcuts portal. KDE uses its mature GlobalAccel integration and the narrowly scoped uinput fallback because its RemoteDesktop portal can block unattended background services; other compositors fall back the same way if their portals are incomplete.
+
+On macOS, approve GigaType under **System Settings → Privacy & Security → Microphone** and **Accessibility** the first time it asks.
+
+Run `gigatype doctor` to see the adapter selected for every runtime layer.
+
+## Privacy and security
+
+- Normal dictation makes no network requests.
+- The model download is verified against committed SHA-256 checksums.
+- Raw microphone audio is deleted after each attempt or cancellation.
+- Transcript history is JSON Lines with `0600` permissions.
+- The portal is preferred because the desktop owns and displays its permissions.
+- The Linux uinput rule is installed only when portal keyboard access fails, grants only the installing user access, and is removed by the uninstaller.
+
+## Architecture
+
+`gigatype daemon` owns a Unix control socket, the CPAL audio stream, three persistent ONNX sessions (encoder, RNN-T predictor, and joint network), desktop adapters, and dictation state. Rust implements the exact 16 kHz log-mel frontend used by GigaAM and SentencePiece decoding. Recordings over 25 seconds are processed in safe 22-second chunks.
+
+The model weights are downloaded separately and are not committed to this repository. GigaType is MIT licensed; the GigaAM model is distributed separately by its publisher under its own MIT license.
+
+## Remove
 
 ```bash
 ./scripts/uninstall.sh
 ```
 
-The uninstall script deliberately keeps the separately installed GigaAM model.
-
-## Privacy and security
-
-- Transcription runs locally. The systemd service forces Hugging Face offline mode after installation.
-- Installation downloads Python packages and model files from PyPI, the official PyTorch CPU index, and Hugging Face. Normal dictation does not use the network.
-- Raw microphone audio is deleted immediately after each transcription attempt or cancellation.
-- Transcript history is plain JSON Lines stored with owner-only `0600` permissions. Delete it at any time if you do not want local history.
-- Direct insertion requires `/dev/uinput`. The installer adds a udev rule that grants only the installing user `0600` access, and the uninstaller removes that rule. Anyone able to replace the process running as that user could synthesize keyboard input, so review the installer before using it on a shared machine.
-- The model weights are downloaded during installation and are not distributed in this repository.
-
-## Scope
-
-This is an early Linux/KDE MVP. Packaging for other distributions, a settings UI, tray controls, non-KDE desktop support, and GPU/ONNX backends are future work rather than release blockers.
-
-## Architecture
-
-`gigatype daemon` owns a Unix control socket and the microphone state. `worker/gigaam_worker.py` loads GigaAM once and accepts one JSON request per line. The Rust process handles audio capture, formatting, KDE clipboard preservation, virtual-keyboard paste, notifications, and history.
-
-## License
-
-GigaType is released under the [MIT License](LICENSE). GigaAM Multilingual is a separate MIT-licensed model downloaded from its publisher at installation time.
+The app, services, permissions, history, and logs are removed. The downloaded GigaAM model is deliberately kept.
