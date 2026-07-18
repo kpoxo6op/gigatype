@@ -34,4 +34,7 @@ jobs:
           tar -C dist -czf "gigatype-${{ matrix.artifact }}.tar.gz" gigatype
       - uses: softprops/action-gh-release@v2
         with:
+          name: GigaType ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
           files: gigatype-${{ matrix.artifact }}.tar.gz

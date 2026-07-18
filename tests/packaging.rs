@@ -56,6 +56,14 @@ fn release_covers_the_major_unix_package_managers() {
 }
 
 #[test]
+fn app_releases_use_consistent_titles_and_generated_notes() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    assert!(workflow.contains("name: GigaType ${{ github.ref_name }}"));
+    assert!(workflow.contains("generate_release_notes: true"));
+    assert!(workflow.contains("make_latest: true"));
+}
+
+#[test]
 fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
     let workflow = repo_file(".github/workflows/ci.yml");
     assert!(workflow.contains("hosted-e2e:"));
