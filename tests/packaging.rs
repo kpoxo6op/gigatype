@@ -67,6 +67,7 @@ fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
     assert!(harness_path.is_file(), "missing hosted E2E harness");
     let harness = fs::read_to_string(harness_path).unwrap();
     assert!(!harness.contains("~/.cargo/bin/cargo"));
+    assert!(harness.contains("RUSTUP_HOME"));
     for boundary in [
         "bootstrap-model.sh",
         "module-null-sink",

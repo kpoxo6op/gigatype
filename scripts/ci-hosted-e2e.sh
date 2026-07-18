@@ -11,6 +11,7 @@ if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
 fi
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+RUNNER_HOME=$HOME
 ARTIFACT_DIR=${RUNNER_TEMP}/gigatype-e2e-artifacts
 RUNTIME_DIR=${RUNNER_TEMP}/gigatype-runtime
 TEST_HOME=${RUNNER_TEMP}/gigatype-home
@@ -42,6 +43,7 @@ mkdir -p "$ARTIFACT_DIR" "$RUNTIME_DIR" "$TEST_HOME"
 chmod 0700 "$RUNTIME_DIR"
 export DISPLAY=:99
 export HOME=$TEST_HOME
+export RUSTUP_HOME=${RUSTUP_HOME:-${RUNNER_HOME}/.rustup}
 export XDG_RUNTIME_DIR=$RUNTIME_DIR
 export GIGATYPE_MODEL=${GIGATYPE_MODEL:-${RUNNER_TEMP}/gigatype-e2e-model}
 export GIGATYPE_NO_NOTIFY=1
