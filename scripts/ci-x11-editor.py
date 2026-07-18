@@ -19,6 +19,7 @@ editor.pack()
 root.update()
 root.lift()
 editor.focus_force()
+print("X11 editor mapped and focused", flush=True)
 
 
 def save_when_stable() -> None:
@@ -28,6 +29,7 @@ def save_when_stable() -> None:
     if text != last_text:
         last_text = text
         stable_since = now
+        print(f"editor content changed: {text!r}", flush=True)
     if text and now - stable_since >= 0.5:
         OUTPUT.write_text(text, encoding="utf-8")
         root.destroy()

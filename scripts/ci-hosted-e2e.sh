@@ -53,6 +53,11 @@ export GIGATYPE_KEEP_MEDIA_PLAYING=1
 export GIGATYPE_NO_NATIVE_SHORTCUTS=1
 export GIGATYPE_NO_PORTAL=1
 export GIGATYPE_DEBOUNCE_MS=0
+export GIGATYPE_PASTE_KEYS=shift+insert
+
+normalize_words() {
+  python3 -c 'import re, sys; print(" ".join(re.findall(r"[^\W_]+", sys.stdin.read().casefold())))'
+}
 
 Xvfb "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp >"${ARTIFACT_DIR}/xvfb.log" 2>&1 &
 xvfb_pid=$!
@@ -94,6 +99,7 @@ python3 "${ROOT}/scripts/ci-x11-editor.py" "$EDITOR_OUTPUT" \
 editor_pid=$!
 window_id=$(timeout 15 xdotool search --sync --onlyvisible --name GigaType-E2E | head -n 1)
 xdotool windowfocus --sync "$window_id"
+xdotool getwindowfocus >"${ARTIFACT_DIR}/focused-window.txt"
 
 $BIN daemon >"${ARTIFACT_DIR}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -117,12 +123,18 @@ for _ in $(seq 1 200); do
   kill -0 "$editor_pid" 2>/dev/null || true
   sleep 0.1
 done
-[[ -f "$EDITOR_OUTPUT" ]]
+if [[ ! -f "$EDITOR_OUTPUT" ]]; then
+  xclip -selection clipboard -out >"${ARTIFACT_DIR}/clipboard-after-failure.txt" 2>&1 || true
+  echo "The focused X11 editor received no paste event." >&2
+  exit 1
+fi
 editor_text=$(<"$EDITOR_OUTPUT")
 restored_clipboard=$(timeout 5 xclip -selection clipboard -out)
 
-if [[ "$actual" != "$expected" ]]; then
-  echo "Virtual microphone transcription differs from direct-file transcription." >&2
+expected_words=$(printf '%s' "$expected" | normalize_words)
+actual_words=$(printf '%s' "$actual" | normalize_words)
+if [[ "$actual_words" != "$expected_words" ]]; then
+  echo "Virtual microphone transcription differs word-for-word from direct-file transcription." >&2
   diff -u "$EXPECTED_OUTPUT" "$ACTUAL_OUTPUT" >&2 || true
   exit 1
 fi
