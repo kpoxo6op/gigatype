@@ -129,6 +129,30 @@ fn socket_path() -> PathBuf {
     runtime_dir().join("gigatype.sock")
 }
 
+fn transcribing_path() -> PathBuf {
+    runtime_dir().join("gigatype-transcribing")
+}
+
+struct TranscribingGuard {
+    path: PathBuf,
+}
+
+impl TranscribingGuard {
+    fn start() -> Result<Self, String> {
+        let path = transcribing_path();
+        fs::write(&path, "transcribing\n").map_err(|error| error.to_string())?;
+        eprintln!("GigaType state: recording -> transcribing");
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TranscribingGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        eprintln!("GigaType state: transcribing -> idle");
+    }
+}
+
 enum DictationState {
     Idle,
     Recording {
@@ -263,27 +287,41 @@ fn play_sound(cue: SoundCue) {
             "/usr/share/sounds/freedesktop/stereo/device-removed.oga",
         ),
     };
-    if let Some(log) = env::var_os("GIGATYPE_SOUND_LOG") {
+    let result = if let Some(log) = env::var_os("GIGATYPE_SOUND_LOG") {
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
-            let _ = writeln!(file, "{label}");
-        }
-        return;
-    }
-    let custom = env::var_os(variable).map(PathBuf::from);
-    let sound = custom.clone().unwrap_or_else(|| PathBuf::from(fallback));
-    if custom.is_some() && sound.is_file() {
-        let player = if cfg!(target_os = "macos") {
-            "afplay"
+            writeln!(file, "{label}").map_err(|error| error.to_string())
         } else {
-            "pw-play"
-        };
-        let _ = Command::new(player)
-            .arg(sound)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            Err("could not open the sound log".into())
+        }
     } else {
-        let _ = audio::play_cue(matches!(cue, SoundCue::Listening));
+        let custom = env::var_os(variable).map(PathBuf::from);
+        let sound = custom.clone().unwrap_or_else(|| PathBuf::from(fallback));
+        if custom.is_some() && sound.is_file() {
+            let player = if cfg!(target_os = "macos") {
+                "afplay"
+            } else {
+                "pw-play"
+            };
+            Command::new(player)
+                .arg(sound)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|error| error.to_string())
+                .and_then(|status| {
+                    status
+                        .success()
+                        .then_some(())
+                        .ok_or_else(|| format!("{player} exited with {status}"))
+                })
+        } else {
+            audio::play_cue(matches!(cue, SoundCue::Listening))
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("GigaType cue: {label} failed: {error}");
+    } else {
+        eprintln!("GigaType cue: {label} played");
     }
 }
 
@@ -508,7 +546,11 @@ fn audio_has_speech(audio_path: &Path) -> Result<bool, String> {
         sample_count += 1;
     }
     let rms = (squared / sample_count as f64).sqrt();
-    Ok(rms >= threshold && loud_samples * 200 >= sample_count)
+    let has_speech = rms >= threshold && loud_samples * 200 >= sample_count;
+    eprintln!(
+        "GigaType audio: rms={rms:.2}, threshold={threshold:.2}, loud_samples={loud_samples}/{sample_count}, speech={has_speech}"
+    );
+    Ok(has_speech)
 }
 
 fn save_history(text: &str) -> Result<(), String> {
@@ -1148,20 +1190,35 @@ fn finish_dictation(
     audio_path: &Path,
     media: MediaGuard,
 ) -> Result<String, String> {
+    let _transcribing = TranscribingGuard::start()?;
     let stopped = stop_recording(recorder, audio_path);
     media.resume();
+    play_sound(SoundCue::Transcribing);
     stopped?;
-    if env::var_os("GIGATYPE_FAKE_RECORDING").is_none() && !audio_has_speech(audio_path)? {
+    let no_speech = env::var_os("GIGATYPE_FAKE_NO_SPEECH").is_some()
+        || (env::var_os("GIGATYPE_FAKE_RECORDING").is_none() && !audio_has_speech(audio_path)?);
+    if no_speech {
         let _ = fs::remove_file(audio_path);
+        eprintln!("GigaType speech: rejected as silence");
         notify(
             "No speech detected",
             "Recording was silent and was not transcribed",
         );
         return Err("no speech was detected".into());
     }
-    play_sound(SoundCue::Transcribing);
     notify("Transcribing…", "GigaAM is processing your speech locally");
+    let transcription_started = Instant::now();
     let transcription = transcriber.transcribe(audio_path);
+    match &transcription {
+        Ok(_) => eprintln!(
+            "GigaType transcription: completed in {:.2}s",
+            transcription_started.elapsed().as_secs_f64()
+        ),
+        Err(error) => eprintln!(
+            "GigaType transcription: failed after {:.2}s: {error}",
+            transcription_started.elapsed().as_secs_f64()
+        ),
+    }
     let cleanup = fs::remove_file(audio_path)
         .map_err(|error| format!("could not delete temporary recording: {error}"));
     let text = postprocess(&transcription?);
@@ -1173,11 +1230,13 @@ fn finish_dictation(
     if env::var_os("GIGATYPE_NO_INSERT").is_none() {
         if let Err(error) = insert_text(&text) {
             put_on_clipboard(&text)?;
+            eprintln!("GigaType insertion: failed ({error}); copied to clipboard");
             notify(
                 "Text copied",
                 &format!("Auto-insert unavailable ({error}). Press Ctrl+V."),
             );
         } else {
+            eprintln!("GigaType insertion: completed");
             notify("Inserted", "Russian transcription typed at the cursor");
         }
     }
@@ -1269,6 +1328,7 @@ fn discard_recording(state: &mut DictationState, notification: (&str, &str)) -> 
 fn daemon() -> Result<(), String> {
     fs::create_dir_all(runtime_dir()).map_err(|error| error.to_string())?;
     let _ = fs::remove_file(runtime_dir().join("gigatype-recording.wav"));
+    let _ = fs::remove_file(transcribing_path());
     let path = socket_path();
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
@@ -1365,6 +1425,7 @@ fn daemon() -> Result<(), String> {
                 DictationState::Idle => match start_recording() {
                     Ok(recording) => {
                         state = recording;
+                        eprintln!("GigaType state: idle -> recording");
                         Ok("recording".into())
                     }
                     Err(error) => Err(error),
@@ -1411,6 +1472,10 @@ fn daemon() -> Result<(), String> {
 }
 
 fn send_daemon(command: &str) -> Result<String, String> {
+    if matches!(command, "toggle" | "cancel" | "status") && transcribing_path().is_file() {
+        eprintln!("GigaType command: {command} ignored while transcribing");
+        return Ok("transcribing".into());
+    }
     let mut stream = UnixStream::connect(socket_path())
         .map_err(|_| "GigaType service is not running; run scripts/install.sh first".to_string())?;
     writeln!(stream, "{command}").map_err(|error| error.to_string())?;

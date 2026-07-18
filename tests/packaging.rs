@@ -18,6 +18,7 @@ fn stopping_the_service_removes_interrupted_private_audio() {
     let service = repo_file("packaging/systemd/gigatype.service");
     assert!(service.contains("ExecStopPost="));
     assert!(service.contains("gigatype-recording.wav"));
+    assert!(service.contains("gigatype-transcribing"));
 }
 
 #[test]

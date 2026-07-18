@@ -92,6 +92,103 @@ fn toggle_starts_and_stops_one_recording() {
 }
 
 #[test]
+fn successful_dictation_logs_the_complete_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path();
+    let diagnostic_log = runtime.join("daemon.log");
+    let daemon = daemon_command(runtime)
+        .env("GIGATYPE_DEBOUNCE_MS", "0")
+        .stderr(std::fs::File::create(&diagnostic_log).unwrap())
+        .spawn()
+        .unwrap();
+    let _guard = KillOnDrop(daemon);
+    wait_for_socket(runtime);
+
+    assert!(run(runtime, "toggle").status.success());
+    assert!(run(runtime, "toggle").status.success());
+
+    let diagnostics = std::fs::read_to_string(diagnostic_log).unwrap();
+    assert!(diagnostics.contains("GigaType state: idle -> recording"));
+    assert!(diagnostics.contains("GigaType state: recording -> transcribing"));
+    assert!(diagnostics.contains("GigaType transcription: completed in"));
+    assert!(diagnostics.contains("GigaType state: transcribing -> idle"));
+}
+
+#[test]
+fn silent_recording_still_confirms_stop_and_logs_the_rejection() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path();
+    let sound_log = runtime.join("sounds.log");
+    let diagnostic_log = runtime.join("daemon.log");
+    std::fs::write(&sound_log, "").unwrap();
+    let daemon = daemon_command(runtime)
+        .env("GIGATYPE_SOUND_LOG", &sound_log)
+        .env("GIGATYPE_FAKE_NO_SPEECH", "1")
+        .env("GIGATYPE_DEBOUNCE_MS", "0")
+        .stderr(std::fs::File::create(&diagnostic_log).unwrap())
+        .spawn()
+        .unwrap();
+    let _guard = KillOnDrop(daemon);
+    wait_for_socket(runtime);
+
+    assert!(run(runtime, "toggle").status.success());
+    let stop = run(runtime, "toggle");
+    assert!(!stop.status.success());
+    assert!(String::from_utf8_lossy(&stop.stderr).contains("no speech was detected"));
+    assert_eq!(
+        std::fs::read_to_string(sound_log).unwrap(),
+        "listening\ntranscribing\n"
+    );
+    let diagnostics = std::fs::read_to_string(diagnostic_log).unwrap();
+    assert!(diagnostics.contains("GigaType state: recording -> transcribing"));
+    assert!(diagnostics.contains("GigaType speech: rejected as silence"));
+}
+
+#[test]
+fn toggle_during_transcription_is_rejected_instead_of_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path();
+    let clipboard_log = runtime.join("clipboard.log");
+    let key_log = runtime.join("keys.log");
+    let mut command = daemon_command(runtime);
+    command
+        .env_remove("GIGATYPE_NO_INSERT")
+        .env("GIGATYPE_FAKE_CLIPBOARD_LOG", &clipboard_log)
+        .env("GIGATYPE_FAKE_CLIPBOARD_MIMES", "text/plain")
+        .env("GIGATYPE_FAKE_KEY_LOG", &key_log)
+        .env("GIGATYPE_CLIPBOARD_RESTORE_MS", "800")
+        .env("GIGATYPE_DEBOUNCE_MS", "0");
+    let daemon = command.spawn().unwrap();
+    let _guard = KillOnDrop(daemon);
+    wait_for_socket(runtime);
+
+    assert!(run(runtime, "toggle").status.success());
+    let runtime_for_stop = runtime.to_path_buf();
+    let stop = thread::spawn(move || run(&runtime_for_stop, "toggle"));
+    let marker = runtime.join("gigatype-transcribing");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "daemon should expose the transcribing state"
+    );
+
+    let started = Instant::now();
+    let duplicate = run(runtime, "toggle");
+    assert!(duplicate.status.success());
+    assert_eq!(String::from_utf8_lossy(&duplicate.stdout), "transcribing\n");
+    assert!(started.elapsed() < Duration::from_millis(250));
+
+    assert!(stop.join().unwrap().status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run(runtime, "status").stdout),
+        "idle\n"
+    );
+}
+
+#[test]
 fn ignores_accidental_double_press_then_allows_cancel() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path();
