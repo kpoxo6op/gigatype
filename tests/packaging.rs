@@ -68,6 +68,8 @@ fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
     let harness = fs::read_to_string(harness_path).unwrap();
     assert!(!harness.contains("~/.cargo/bin/cargo"));
     assert!(harness.contains("RUSTUP_HOME"));
+    assert!(harness.contains("windowfocus --sync"));
+    assert!(!harness.contains("windowactivate"));
     for boundary in [
         "bootstrap-model.sh",
         "module-null-sink",

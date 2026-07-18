@@ -93,7 +93,7 @@ python3 "${ROOT}/scripts/ci-x11-editor.py" "$EDITOR_OUTPUT" \
   >"${ARTIFACT_DIR}/editor.log" 2>&1 &
 editor_pid=$!
 window_id=$(timeout 15 xdotool search --sync --onlyvisible --name GigaType-E2E | head -n 1)
-xdotool windowactivate --sync "$window_id"
+xdotool windowfocus --sync "$window_id"
 
 $BIN daemon >"${ARTIFACT_DIR}/daemon.log" 2>&1 &
 daemon_pid=$!
