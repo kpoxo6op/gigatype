@@ -77,7 +77,7 @@ curl --fail --location --retry 3 --output "$FIXTURE" "$FIXTURE_URL"
 printf '%s  %s\n' "$FIXTURE_SHA256" "$FIXTURE" | sha256sum --check -
 
 "${ROOT}/scripts/bootstrap-model.sh"
-~/.cargo/bin/cargo build --release --locked
+cargo build --release --locked
 BIN=${ROOT}/target/release/gigatype
 
 expected=$("$BIN" transcribe-file "$FIXTURE")
