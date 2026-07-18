@@ -72,9 +72,11 @@ fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
     assert!(!harness.contains("windowactivate"));
     assert!(harness.contains("GIGATYPE_PASTE_KEYS=shift+insert"));
     assert!(harness.contains("casefold"));
-    assert!(harness.contains("xfce4-clipman"));
-    assert!(workflow.contains("dbus-x11"));
-    assert!(workflow.contains("xfce4-clipman"));
+    assert!(!harness.contains("xfce4-clipman"));
+    assert!(!workflow.contains("xfce4-clipman"));
+    let main = repo_file("src/main.rs");
+    assert!(main.contains("static DESKTOP_CLIPBOARD"));
+    assert!(main.contains("with_desktop_clipboard"));
     for boundary in [
         "bootstrap-model.sh",
         "module-null-sink",

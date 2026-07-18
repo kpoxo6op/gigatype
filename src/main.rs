@@ -18,6 +18,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -533,6 +535,26 @@ fn save_history(text: &str) -> Result<(), String> {
     file.write_all(b"\n").map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "linux")]
+static DESKTOP_CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn with_desktop_clipboard<T>(
+    operation: impl FnOnce(&mut arboard::Clipboard) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut owner = DESKTOP_CLIPBOARD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| "desktop clipboard lock was poisoned".to_string())?;
+    if owner.is_none() {
+        *owner = Some(
+            arboard::Clipboard::new()
+                .map_err(|error| format!("could not open the desktop clipboard: {error}"))?,
+        );
+    }
+    operation(owner.as_mut().expect("desktop clipboard was initialized"))
+}
+
 fn put_on_clipboard(text: &str) -> Result<(), String> {
     if let Some(path) = env::var_os("GIGATYPE_FAKE_FALLBACK_CLIPBOARD") {
         return fs::write(path, text).map_err(|error| error.to_string());
@@ -548,8 +570,16 @@ fn put_on_clipboard(text: &str) -> Result<(), String> {
     if status.is_ok_and(|status| status.success()) {
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    return with_desktop_clipboard(|clipboard| {
+        clipboard
+            .set_text(text)
+            .map_err(|error| format!("could not set the desktop clipboard: {error}"))
+    });
+    #[cfg(not(target_os = "linux"))]
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| format!("could not open the desktop clipboard: {error}"))?;
+    #[cfg(not(target_os = "linux"))]
     clipboard
         .set_text(text)
         .map_err(|error| format!("could not set the desktop clipboard: {error}"))
@@ -618,11 +648,14 @@ fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
         }
         return Ok(ClipboardSnapshot { entries });
     }
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|error| format!("could not open the desktop clipboard: {error}"))?;
-    let entries = clipboard
+    #[cfg(target_os = "linux")]
+    let text = with_desktop_clipboard(|clipboard| Ok(clipboard.get_text().ok()))?;
+    #[cfg(not(target_os = "linux"))]
+    let text = arboard::Clipboard::new()
+        .map_err(|error| format!("could not open the desktop clipboard: {error}"))?
         .get_text()
-        .ok()
+        .ok();
+    let entries = text
         .map(|text| ClipboardEntry {
             mime_type: "text/plain;charset=utf-8".into(),
             data: text.into_bytes(),
@@ -669,6 +702,11 @@ fn restore_clipboard(snapshot: ClipboardSnapshot) -> Result<(), String> {
         return Ok(());
     };
     let text = String::from_utf8(entry.data).map_err(|error| error.to_string())?;
+    #[cfg(target_os = "linux")]
+    return with_desktop_clipboard(|clipboard| {
+        clipboard.set_text(text).map_err(|error| error.to_string())
+    });
+    #[cfg(not(target_os = "linux"))]
     arboard::Clipboard::new()
         .map_err(|error| error.to_string())?
         .set_text(text)
