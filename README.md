@@ -115,6 +115,12 @@ Run `gigatype doctor` to see the adapter selected for every runtime layer.
 
 The model weights are downloaded separately and are not committed to this repository. GigaType is MIT licensed; the GigaAM model is distributed separately by its publisher under its own MIT license.
 
+## Testing
+
+The GitHub-hosted E2E job plays GigaAM's checked reference recording through a PulseAudio virtual microphone, captures it through the real CPAL recorder, transcribes it with the real GigaAM ONNX model, inserts the result into a focused X11 editor, and verifies clipboard restoration. It compares the virtual-microphone result with direct transcription of the same recording so missing beginning or ending audio fails the job.
+
+This hosted test does not test a physical microphone or KDE Wayland. Those boundaries require an interactive machine and are deliberately excluded from GitHub-hosted CI.
+
 ## Remove
 
 ```bash

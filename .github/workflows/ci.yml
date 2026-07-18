@@ -49,3 +49,34 @@ jobs:
           test -f flake.nix
           grep -q 'Version:        0.3.0' packaging/rpm/gigatype.spec
           grep -q 'version = "0.3.0"' flake.nix
+
+  hosted-e2e:
+    name: hosted E2E (virtual audio/X11)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache the checked GigaAM model
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/gigatype-e2e-model
+          key: gigaam-v3-e2e-rnnt-${{ hashFiles('packaging/model-sha256.txt') }}
+      - name: Install virtual audio and X11 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            autocutsel cmake libasound2-dev libssl-dev pkg-config \
+            pulseaudio pulseaudio-utils python3-tk x11-utils xclip xdotool xvfb
+      - name: Exercise real capture, GigaAM, insertion, and clipboard restoration
+        env:
+          GIGATYPE_MODEL: ${{ runner.temp }}/gigatype-e2e-model
+        run: ./scripts/ci-hosted-e2e.sh
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-e2e-evidence
+          path: ${{ runner.temp }}/gigatype-e2e-artifacts
+          if-no-files-found: warn
