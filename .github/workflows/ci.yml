@@ -67,8 +67,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            autocutsel cmake libasound2-dev libssl-dev pkg-config \
-            pulseaudio pulseaudio-utils python3-tk x11-utils xclip xdotool xvfb
+            cmake dbus-x11 libasound2-dev libssl-dev pkg-config \
+            pulseaudio pulseaudio-utils python3-tk x11-utils xclip xdotool \
+            xfce4-clipman xvfb
       - name: Exercise real capture, GigaAM, insertion, and clipboard restoration
         env:
           GIGATYPE_MODEL: ${{ runner.temp }}/gigatype-e2e-model

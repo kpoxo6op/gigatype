@@ -25,6 +25,7 @@ FIXTURE_SHA256=d8aaaa18a5098d7c6de0595ae7ac1e64cacd0d4022af3595213bdaf23be77e69
 
 daemon_pid=
 editor_pid=
+clipman_pid=
 xvfb_pid=
 
 cleanup() {
@@ -32,6 +33,7 @@ cleanup() {
   set +e
   [[ -n "$daemon_pid" ]] && kill "$daemon_pid" 2>/dev/null
   [[ -n "$editor_pid" ]] && kill "$editor_pid" 2>/dev/null
+  [[ -n "$clipman_pid" ]] && kill "$clipman_pid" 2>/dev/null
   [[ -n "$xvfb_pid" ]] && kill "$xvfb_pid" 2>/dev/null
   pactl list short sinks >"${ARTIFACT_DIR}/pulse-sinks.txt" 2>&1
   pactl list short sources >"${ARTIFACT_DIR}/pulse-sources.txt" 2>&1
@@ -66,7 +68,11 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 xdpyinfo >/dev/null
-autocutsel -fork -selection CLIPBOARD
+eval "$(dbus-launch --exit-with-x11 --sh-syntax)"
+xfce4-clipman >"${ARTIFACT_DIR}/clipman.log" 2>&1 &
+clipman_pid=$!
+sleep 1
+kill -0 "$clipman_pid"
 
 pulseaudio --start --exit-idle-time=-1 --log-target="file:${ARTIFACT_DIR}/pulseaudio.log"
 for _ in $(seq 1 100); do
