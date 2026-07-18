@@ -1,11 +1,13 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OUTPUT_RATE: u32 = 16_000;
+const DECODER_SILENCE_MS: u32 = 250;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RecordingStats {
     sample_count: usize,
@@ -14,9 +16,70 @@ struct RecordingStats {
     rms: f32,
 }
 
+struct CaptureChunk {
+    capture_start_nanos: u128,
+    samples: Vec<f32>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    chunks: Vec<CaptureChunk>,
+    last_callback_anchor: Option<(u128, Instant)>,
+    latest_capture_end_nanos: u128,
+}
+
+type SharedCapture = Arc<(Mutex<CaptureState>, Condvar)>;
+
+fn finalize_capture(
+    chunks: &[CaptureChunk],
+    cutoff_nanos: u128,
+    sample_rate: u32,
+    channels: usize,
+    synthetic_silence_frames: usize,
+) -> Vec<f32> {
+    let mut samples = Vec::new();
+    for chunk in chunks {
+        if chunk.capture_start_nanos >= cutoff_nanos {
+            continue;
+        }
+        let available_frames = chunk.samples.len() / channels;
+        let duration_nanos = cutoff_nanos - chunk.capture_start_nanos;
+        let frames_before_cutoff = duration_nanos
+            .saturating_mul(sample_rate as u128)
+            .div_ceil(1_000_000_000) as usize;
+        let keep_samples = available_frames.min(frames_before_cutoff) * channels;
+        samples.extend_from_slice(&chunk.samples[..keep_samples]);
+    }
+    samples.resize(samples.len() + synthetic_silence_frames * channels, 0.0);
+    samples
+}
+
+fn stream_time_at(
+    anchor_stream_nanos: u128,
+    anchor_host_time: std::time::Instant,
+    target_host_time: std::time::Instant,
+) -> u128 {
+    if target_host_time >= anchor_host_time {
+        anchor_stream_nanos
+            .saturating_add(target_host_time.duration_since(anchor_host_time).as_nanos())
+    } else {
+        anchor_stream_nanos
+            .saturating_sub(anchor_host_time.duration_since(target_host_time).as_nanos())
+    }
+}
+
+fn capture_config(supported: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+    let mut config = supported.config();
+    if let cpal::SupportedBufferSize::Range { min, max } = *supported.buffer_size() {
+        let twenty_ms = (supported.sample_rate() / 50).clamp(min, max);
+        config.buffer_size = cpal::BufferSize::Fixed(twenty_ms);
+    }
+    config
+}
+
 pub struct Recorder {
     stream: Option<cpal::Stream>,
-    samples: Arc<Mutex<Vec<f32>>>,
+    capture: SharedCapture,
     input_rate: u32,
     channels: usize,
 }
@@ -54,21 +117,21 @@ impl Recorder {
             "GigaType microphone selected: {selected_name} ({input_rate} Hz, {channels} channel(s), {:?})",
             supported.sample_format()
         );
-        let samples = Arc::new(Mutex::new(Vec::new()));
-        let config = supported.config();
+        let capture = Arc::new((Mutex::new(CaptureState::default()), Condvar::new()));
+        let config = capture_config(&supported);
         let stream = match supported.sample_format() {
-            cpal::SampleFormat::I8 => input_stream::<i8>(&device, config, &samples),
-            cpal::SampleFormat::I16 => input_stream::<i16>(&device, config, &samples),
-            cpal::SampleFormat::I24 => input_stream::<cpal::I24>(&device, config, &samples),
-            cpal::SampleFormat::I32 => input_stream::<i32>(&device, config, &samples),
-            cpal::SampleFormat::I64 => input_stream::<i64>(&device, config, &samples),
-            cpal::SampleFormat::U8 => input_stream::<u8>(&device, config, &samples),
-            cpal::SampleFormat::U16 => input_stream::<u16>(&device, config, &samples),
-            cpal::SampleFormat::U24 => input_stream::<cpal::U24>(&device, config, &samples),
-            cpal::SampleFormat::U32 => input_stream::<u32>(&device, config, &samples),
-            cpal::SampleFormat::U64 => input_stream::<u64>(&device, config, &samples),
-            cpal::SampleFormat::F32 => input_stream::<f32>(&device, config, &samples),
-            cpal::SampleFormat::F64 => input_stream::<f64>(&device, config, &samples),
+            cpal::SampleFormat::I8 => input_stream::<i8>(&device, config, &capture),
+            cpal::SampleFormat::I16 => input_stream::<i16>(&device, config, &capture),
+            cpal::SampleFormat::I24 => input_stream::<cpal::I24>(&device, config, &capture),
+            cpal::SampleFormat::I32 => input_stream::<i32>(&device, config, &capture),
+            cpal::SampleFormat::I64 => input_stream::<i64>(&device, config, &capture),
+            cpal::SampleFormat::U8 => input_stream::<u8>(&device, config, &capture),
+            cpal::SampleFormat::U16 => input_stream::<u16>(&device, config, &capture),
+            cpal::SampleFormat::U24 => input_stream::<cpal::U24>(&device, config, &capture),
+            cpal::SampleFormat::U32 => input_stream::<u32>(&device, config, &capture),
+            cpal::SampleFormat::U64 => input_stream::<u64>(&device, config, &capture),
+            cpal::SampleFormat::F32 => input_stream::<f32>(&device, config, &capture),
+            cpal::SampleFormat::F64 => input_stream::<f64>(&device, config, &capture),
             format => return Err(format!("unsupported microphone sample format: {format:?}")),
         }
         .map_err(|error| format!("could not open microphone: {error}"))?;
@@ -77,18 +140,63 @@ impl Recorder {
             .map_err(|error| format!("could not start microphone: {error}"))?;
         Ok(Self {
             stream: Some(stream),
-            samples,
+            capture,
             input_rate,
             channels,
         })
     }
 
     pub fn stop(mut self, output: &Path) -> Result<(), String> {
+        let cutoff_host_time = Instant::now();
+        let cutoff_nanos = {
+            let (lock, ready) = &*self.capture;
+            let deadline = Instant::now() + DRAIN_TIMEOUT;
+            let mut state = lock.lock().map_err(|error| error.to_string())?;
+            while state.last_callback_anchor.is_none() && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (next, timeout) = ready
+                    .wait_timeout(state, remaining)
+                    .map_err(|error| error.to_string())?;
+                state = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            let Some((callback_stream_nanos, callback_host_time)) = state.last_callback_anchor
+            else {
+                return Err("the microphone produced no audio".into());
+            };
+            let cutoff =
+                stream_time_at(callback_stream_nanos, callback_host_time, cutoff_host_time);
+            while state.latest_capture_end_nanos < cutoff && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (next, timeout) = ready
+                    .wait_timeout(state, remaining)
+                    .map_err(|error| error.to_string())?;
+                state = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            cutoff
+        };
         self.stream.take();
-        let interleaved = self.samples.lock().map_err(|error| error.to_string())?;
-        if interleaved.is_empty() {
+        let chunks = {
+            let (lock, _) = &*self.capture;
+            let mut state = lock.lock().map_err(|error| error.to_string())?;
+            std::mem::take(&mut state.chunks)
+        };
+        if chunks.is_empty() {
             return Err("the microphone produced no audio".into());
         }
+        let silence_frames = self.input_rate as usize * DECODER_SILENCE_MS as usize / 1_000;
+        let interleaved = finalize_capture(
+            &chunks,
+            cutoff_nanos,
+            self.input_rate,
+            self.channels,
+            silence_frames,
+        );
         let mono = downmix(&interleaved, self.channels);
         let samples = resample_linear(&mono, self.input_rate, OUTPUT_RATE);
         let stats = recording_stats(&samples, OUTPUT_RATE);
@@ -114,19 +222,36 @@ where
 fn input_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    samples: &Arc<Mutex<Vec<f32>>>,
+    capture: &SharedCapture,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
-    let sink = Arc::clone(samples);
+    let sink = Arc::clone(capture);
+    let sample_rate = config.sample_rate;
+    let channels = config.channels as usize;
     device.build_input_stream(
         config,
-        move |data: &[T], _| {
-            sink.lock()
-                .unwrap()
-                .extend(data.iter().copied().map(f32::from_sample));
+        move |data: &[T], info| {
+            let timestamp = info.timestamp();
+            let capture_start_nanos = timestamp.capture.as_nanos();
+            let frame_count = data.len() / channels;
+            let duration_nanos =
+                (frame_count as u128 * 1_000_000_000).div_ceil(sample_rate as u128);
+            let chunk = CaptureChunk {
+                capture_start_nanos,
+                samples: data.iter().copied().map(f32::from_sample).collect(),
+            };
+            let (lock, ready) = &*sink;
+            if let Ok(mut state) = lock.lock() {
+                state.latest_capture_end_nanos = state
+                    .latest_capture_end_nanos
+                    .max(capture_start_nanos.saturating_add(duration_nanos));
+                state.last_callback_anchor = Some((timestamp.callback.as_nanos(), Instant::now()));
+                state.chunks.push(chunk);
+                ready.notify_all();
+            }
         },
         |error| eprintln!("GigaType microphone stream: {error}"),
         None,
@@ -379,5 +504,45 @@ mod tests {
         assert_eq!(selected.channels(), 1);
         assert_eq!(selected.sample_rate(), OUTPUT_RATE);
         assert_eq!(selected.sample_format(), cpal::SampleFormat::I16);
+    }
+
+    #[test]
+    fn timestamped_capture_trims_at_stop_and_adds_only_synthetic_silence() {
+        let chunks = vec![CaptureChunk {
+            capture_start_nanos: 0,
+            samples: vec![0.5; 100],
+        }];
+        let audio = finalize_capture(&chunks, 75_000_000, 1_000, 1, 20);
+        assert_eq!(audio.len(), 95);
+        assert!(audio[..75].iter().all(|sample| *sample == 0.5));
+        assert!(audio[75..].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn f9_cutoff_is_mapped_onto_the_audio_stream_clock() {
+        let callback = std::time::Instant::now();
+        let cutoff = callback + Duration::from_millis(7);
+        assert_eq!(stream_time_at(100_000_000, callback, cutoff), 107_000_000);
+    }
+
+    #[test]
+    fn callback_arriving_after_f9_maps_back_to_the_exact_cutoff() {
+        let cutoff = std::time::Instant::now();
+        let callback = cutoff + Duration::from_millis(7);
+        assert_eq!(stream_time_at(100_000_000, callback, cutoff), 93_000_000);
+    }
+
+    #[test]
+    fn capture_uses_small_supported_buffers_instead_of_one_second_blocks() {
+        let supported = cpal::SupportedStreamConfig::new(
+            1,
+            16_000,
+            cpal::SupportedBufferSize::Range { min: 64, max: 4096 },
+            cpal::SampleFormat::I16,
+        );
+        assert_eq!(
+            capture_config(&supported).buffer_size,
+            cpal::BufferSize::Fixed(320)
+        );
     }
 }
