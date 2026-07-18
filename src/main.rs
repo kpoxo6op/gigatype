@@ -755,6 +755,34 @@ enum PasteChord {
     ShiftInsert,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LinuxKeyboardRoute {
+    Portal,
+    Enigo,
+    Uinput,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_keyboard_route(
+    wayland: bool,
+    display: bool,
+    desktop: &str,
+    no_portal: bool,
+) -> LinuxKeyboardRoute {
+    if wayland {
+        if !no_portal && !desktop.to_ascii_lowercase().contains("kde") {
+            LinuxKeyboardRoute::Portal
+        } else {
+            LinuxKeyboardRoute::Uinput
+        }
+    } else if display {
+        LinuxKeyboardRoute::Enigo
+    } else {
+        LinuxKeyboardRoute::Uinput
+    }
+}
+
 impl PasteChord {
     fn from_env() -> Result<Self, String> {
         match env::var("GIGATYPE_PASTE_KEYS")
@@ -840,14 +868,24 @@ fn paste_shortcut(probe_only: bool) -> Result<(), String> {
     }
 
     #[cfg(target_os = "linux")]
-    if env::var_os("WAYLAND_DISPLAY").is_some()
-        && env::var_os("GIGATYPE_NO_PORTAL").is_none()
-        && portal::paste(chord, probe_only).is_ok()
-    {
+    let linux_route = linux_keyboard_route(
+        env::var_os("WAYLAND_DISPLAY").is_some(),
+        env::var_os("DISPLAY").is_some(),
+        &env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        env::var_os("GIGATYPE_NO_PORTAL").is_some(),
+    );
+
+    #[cfg(target_os = "linux")]
+    if linux_route == LinuxKeyboardRoute::Portal && portal::paste(chord, probe_only).is_ok() {
         return Ok(());
     }
 
-    if cfg!(not(target_os = "linux")) || env::var_os("DISPLAY").is_some() {
+    #[cfg(target_os = "linux")]
+    let use_enigo = linux_route == LinuxKeyboardRoute::Enigo;
+    #[cfg(not(target_os = "linux"))]
+    let use_enigo = true;
+
+    if use_enigo {
         let mut enigo = Enigo::new(&Settings::default())
             .map_err(|error| format!("could not open native keyboard adapter: {error}"))?;
         if probe_only {
@@ -1475,5 +1513,14 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(file.path(), wav(&samples)).unwrap();
         assert!(audio_has_speech(file.path()).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_wayland_uses_uinput_even_when_xwayland_sets_display() {
+        assert_eq!(
+            linux_keyboard_route(true, true, "KDE", false),
+            LinuxKeyboardRoute::Uinput
+        );
     }
 }

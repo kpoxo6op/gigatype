@@ -149,10 +149,19 @@ where
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime
-        .block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(45),
-            future,
-        ))
-        .map_err(|_| "desktop portal authorization timed out".to_string())?
+    runtime.block_on(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(45), future)
+            .await
+            .map_err(|_| "desktop portal authorization timed out".to_string())?
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_timeout_is_created_inside_its_runtime() {
+        assert_eq!(run_portal(async { Ok(()) }), Ok(()));
+    }
 }
