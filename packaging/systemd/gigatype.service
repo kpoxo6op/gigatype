@@ -12,4 +12,4 @@ RestartSec=2
 Environment=GIGATYPE_MODEL=%h/.local/share/gigatype/models/gigaam-v3-e2e-rnnt
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

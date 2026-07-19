@@ -22,6 +22,21 @@ fn stopping_the_service_removes_interrupted_private_audio() {
 }
 
 #[test]
+fn daemon_starts_only_after_the_graphical_session_is_ready() {
+    let service = repo_file("packaging/systemd/gigatype.service");
+    assert!(service.contains("After=graphical-session.target"));
+    assert!(service.contains("PartOf=graphical-session.target"));
+    assert!(service.contains("WantedBy=graphical-session.target"));
+    assert!(!service.contains("WantedBy=default.target"));
+}
+
+#[test]
+fn installer_migrates_existing_service_enablement_to_the_graphical_session() {
+    let installer = repo_file("scripts/install.sh");
+    assert!(installer.contains("systemctl --user reenable gigatype.service"));
+}
+
+#[test]
 fn installer_requires_the_complete_v3_checkpoint() {
     let scripts = repo_file("scripts/install.sh") + &repo_file("scripts/bootstrap-model.sh");
     assert!(scripts.contains("v3_e2e_rnnt_encoder.onnx"));

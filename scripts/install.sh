@@ -81,7 +81,7 @@ case "$(uname -s)" in
       install -d "$SYSTEMD_DIR"
       install -m 0644 packaging/systemd/gigatype.service "$SYSTEMD_DIR/gigatype.service"
       systemctl --user daemon-reload
-      systemctl --user enable gigatype.service
+      systemctl --user reenable gigatype.service
     else
       install -d "$AUTOSTART_DIR"
       install -m 0644 packaging/autostart/io.github.gigatype.autostart.desktop \
