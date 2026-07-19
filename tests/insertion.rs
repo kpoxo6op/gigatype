@@ -1,4 +1,5 @@
 use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[test]
