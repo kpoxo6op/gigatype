@@ -389,3 +389,58 @@ fn failed_auto_insert_leaves_the_transcript_on_the_clipboard() {
     assert!(run(runtime, "toggle").status.success());
     assert_eq!(std::fs::read_to_string(fallback).unwrap(), "Это тест.");
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stalled_clipboard_provider_does_not_block_future_dictation() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path();
+    let diagnostic_log = runtime.join("daemon.log");
+    let sound_log = runtime.join("sounds.log");
+    let insert_log = runtime.join("insert.log");
+    let clipboard_log = runtime.join("clipboard.log");
+    let daemon = daemon_command(runtime)
+        .env_remove("GIGATYPE_NO_INSERT")
+        .env("GIGATYPE_DEBOUNCE_MS", "0")
+        .env("GIGATYPE_SOUND_LOG", &sound_log)
+        .env("GIGATYPE_FAKE_INSERT_LOG", &insert_log)
+        .env("GIGATYPE_FAKE_CLIPBOARD_LOG", &clipboard_log)
+        .env("GIGATYPE_FAKE_CLIPBOARD_STALL", "1")
+        .env("GIGATYPE_CLIPBOARD_TIMEOUT_MS", "50")
+        .env("GIGATYPE_CLIPBOARD_RESTORE_MS", "0")
+        .stderr(std::fs::File::create(&diagnostic_log).unwrap())
+        .spawn()
+        .unwrap();
+    let _guard = KillOnDrop(daemon);
+    wait_for_socket(runtime);
+
+    assert!(run(runtime, "toggle").status.success());
+    let started = Instant::now();
+    let stop = run(runtime, "toggle");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "clipboard timeout must return control to F9"
+    );
+    assert!(stop.status.success());
+    assert_eq!(String::from_utf8_lossy(&stop.stdout), "Это тест.\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run(runtime, "status").stdout),
+        "idle\n"
+    );
+
+    assert!(run(runtime, "toggle").status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run(runtime, "status").stdout),
+        "recording\n"
+    );
+    assert!(run(runtime, "cancel").status.success());
+    assert_eq!(
+        std::fs::read_to_string(sound_log).unwrap(),
+        "listening\ntranscribing\nlistening\n"
+    );
+    let diagnostics = std::fs::read_to_string(diagnostic_log).unwrap();
+    assert!(
+        diagnostics.contains("preservation skipped"),
+        "diagnostics were: {diagnostics}"
+    );
+}

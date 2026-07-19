@@ -50,6 +50,8 @@ The model is downloaded once. Normal dictation works offline.
 
 GitHub-hosted E2E tests the real GigaAM model through a virtual microphone, checks that the beginning and end of the recording are preserved, inserts the result into a focused X11 editor, and verifies clipboard restoration.
 
+CI also holds a fake clipboard transfer open indefinitely and verifies that GigaType times out, inserts without preserving that clipboard, returns to idle, and accepts the next `F9`.
+
 It does not test a physical microphone or KDE Wayland. Those require an interactive machine.
 
 ## Remove

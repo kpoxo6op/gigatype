@@ -648,7 +648,85 @@ fn append_fake_clipboard_log(line: &str) -> Result<(), String> {
     writeln!(file, "{line}").map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn clipboard_timeout() -> Duration {
+    Duration::from_millis(
+        env::var("GIGATYPE_CLIPBOARD_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1000)
+            .clamp(10, 5000),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn read_clipboard_pipe_until<R: Read + AsRawFd>(
+    reader: &mut R,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    const MAX_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
+    let mut data = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "clipboard data transfer timed out after {}ms",
+                timeout.as_millis()
+            ));
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("could not wait for clipboard data: {error}"));
+        }
+        if ready == 0 {
+            return Err(format!(
+                "clipboard data transfer timed out after {}ms",
+                timeout.as_millis()
+            ));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err("clipboard data pipe became invalid".into());
+        }
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            return Err("clipboard data pipe failed".into());
+        }
+
+        let mut chunk = [0_u8; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(data),
+            Ok(read) => {
+                data.extend_from_slice(&chunk[..read]);
+                if data.len() > MAX_CLIPBOARD_BYTES {
+                    return Err("clipboard data exceeded the 64 MiB safety limit".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("could not read clipboard data: {error}")),
+        }
+    }
+}
+
 fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
+    #[cfg(target_os = "linux")]
+    if env::var_os("GIGATYPE_FAKE_CLIPBOARD_STALL").is_some() {
+        let (mut reader, _writer) = UnixStream::pair().map_err(|error| error.to_string())?;
+        let timeout = clipboard_timeout();
+        let deadline = Instant::now() + timeout;
+        read_clipboard_pipe_until(&mut reader, deadline, timeout)?;
+        return Err("fake stalled clipboard unexpectedly returned data".into());
+    }
     if env::var_os("GIGATYPE_FAKE_CLIPBOARD_LOG").is_some() {
         let mime_types = env::var("GIGATYPE_FAKE_CLIPBOARD_MIMES").unwrap_or_default();
         append_fake_clipboard_log(&format!("capture:{mime_types}"))?;
@@ -666,6 +744,8 @@ fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
 
     #[cfg(target_os = "linux")]
     if env::var_os("WAYLAND_DISPLAY").is_some() {
+        let timeout = clipboard_timeout();
+        let deadline = Instant::now() + timeout;
         let mime_types = match paste::get_mime_types_ordered(
             paste::ClipboardType::Regular,
             paste::Seat::Unspecified,
@@ -682,10 +762,10 @@ fn capture_clipboard() -> Result<ClipboardSnapshot, String> {
                 paste::MimeType::Specific(&mime_type),
             )
             .map_err(|error| format!("could not preserve clipboard type {mime_type}: {error}"))?;
-            let mut data = Vec::new();
-            pipe.read_to_end(&mut data).map_err(|error| {
-                format!("could not preserve clipboard type {mime_type}: {error}")
-            })?;
+            let data =
+                read_clipboard_pipe_until(&mut pipe, deadline, timeout).map_err(|error| {
+                    format!("could not preserve clipboard type {mime_type}: {error}")
+                })?;
             entries.push(ClipboardEntry { mime_type, data });
         }
         return Ok(ClipboardSnapshot { entries });
@@ -1088,7 +1168,13 @@ fn insert_text(text: &str) -> Result<(), String> {
             return fs::write(path, text).map_err(|error| error.to_string());
         }
     }
-    let previous = capture_clipboard()?;
+    let previous = match capture_clipboard() {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            eprintln!("GigaType clipboard: preservation skipped ({error})");
+            None
+        }
+    };
     set_transcript_clipboard(text)?;
     let result = if let Some(path) = env::var_os("GIGATYPE_FAKE_INSERT_LOG") {
         fs::write(path, text).map_err(|error| error.to_string())
@@ -1102,7 +1188,7 @@ fn insert_text(text: &str) -> Result<(), String> {
         .min(5000);
     append_fake_clipboard_log(&format!("wait:{restore_ms}ms"))?;
     thread::sleep(Duration::from_millis(restore_ms));
-    let restore = restore_clipboard(previous);
+    let restore = previous.map_or(Ok(()), restore_clipboard);
     result.and(restore)
 }
 
