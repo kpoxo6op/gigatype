@@ -1,0 +1,40 @@
+name: Release packages
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: macos-14
+            artifact: macos-arm64
+          - os: macos-13
+            artifact: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes cmake libasound2-dev libssl-dev pkg-config
+      - run: cargo build --release --locked
+      - name: Assemble archive
+        run: |
+          mkdir -p dist/gigatype
+          cp target/release/gigatype scripts/bootstrap-model.sh scripts/install.sh scripts/uninstall.sh dist/gigatype/
+          cp packaging/model-sha256.txt dist/gigatype/
+          tar -C dist -czf "gigatype-${{ matrix.artifact }}.tar.gz" gigatype
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: GigaType ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          files: gigatype-${{ matrix.artifact }}.tar.gz

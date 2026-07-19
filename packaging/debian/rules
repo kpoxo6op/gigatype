@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --locked --release
+
+override_dh_auto_install:
+	install -Dm755 target/release/gigatype debian/gigatype/usr/bin/gigatype
+	install -Dm644 packaging/systemd/gigatype.service debian/gigatype/usr/lib/systemd/user/gigatype.service

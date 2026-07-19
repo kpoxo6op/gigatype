@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn repo_file(path: &str) -> String {
     fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
@@ -17,11 +18,117 @@ fn stopping_the_service_removes_interrupted_private_audio() {
     let service = repo_file("packaging/systemd/gigatype.service");
     assert!(service.contains("ExecStopPost="));
     assert!(service.contains("gigatype-recording.wav"));
+    assert!(service.contains("gigatype-transcribing"));
+}
+
+#[test]
+fn daemon_starts_only_after_the_graphical_session_is_ready() {
+    let service = repo_file("packaging/systemd/gigatype.service");
+    assert!(service.contains("After=graphical-session.target"));
+    assert!(service.contains("PartOf=graphical-session.target"));
+    assert!(service.contains("WantedBy=graphical-session.target"));
+    assert!(!service.contains("WantedBy=default.target"));
+}
+
+#[test]
+fn installer_migrates_existing_service_enablement_to_the_graphical_session() {
+    let installer = repo_file("scripts/install.sh");
+    assert!(installer.contains("systemctl --user reenable gigatype.service"));
 }
 
 #[test]
 fn installer_requires_the_complete_v3_checkpoint() {
+    let scripts = repo_file("scripts/install.sh") + &repo_file("scripts/bootstrap-model.sh");
+    assert!(scripts.contains("v3_e2e_rnnt_encoder.onnx"));
+    assert!(scripts.contains("v3_e2e_rnnt_decoder.onnx"));
+    assert!(scripts.contains("v3_e2e_rnnt_joint.onnx"));
+    assert!(!scripts.contains("requirements-model.txt"));
+}
+
+#[test]
+fn linux_prefers_the_desktop_audio_server_and_checks_alsa_fallback_headers() {
+    let manifest = repo_file("Cargo.toml");
     let installer = repo_file("scripts/install.sh");
-    assert!(installer.contains("gigaam-v3-e2e-rnnt/tokenizer.model"));
-    assert!(installer.contains("gigaam-v3-e2e-rnnt/modeling_gigaam.py"));
+    assert!(manifest.contains("features = [\"pulseaudio\"]"));
+    assert!(installer.contains("pkg-config --exists alsa"));
+}
+
+#[test]
+fn release_covers_the_major_unix_package_managers() {
+    for path in [
+        "packaging/appimage/AppRun",
+        "packaging/debian/control",
+        "packaging/rpm/gigatype.spec",
+        "packaging/homebrew/gigatype.rb",
+        "flake.nix",
+    ] {
+        assert!(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(path)
+                .is_file(),
+            "missing {path}"
+        );
+    }
+}
+
+#[test]
+fn app_releases_use_consistent_titles_and_generated_notes() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    assert!(workflow.contains("name: GigaType ${{ github.ref_name }}"));
+    assert!(workflow.contains("generate_release_notes: true"));
+    assert!(workflow.contains("make_latest: true"));
+}
+
+#[test]
+fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
+    let workflow = repo_file(".github/workflows/ci.yml");
+    assert!(workflow.contains("hosted-e2e:"));
+    assert!(workflow.contains("runs-on: ubuntu-latest"));
+    assert!(workflow.contains("./scripts/ci-hosted-e2e.sh"));
+    assert!(!workflow.contains("runs-on: self-hosted"));
+
+    let harness_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-hosted-e2e.sh");
+    assert!(harness_path.is_file(), "missing hosted E2E harness");
+    let harness = fs::read_to_string(harness_path).unwrap();
+    assert!(!harness.contains("~/.cargo/bin/cargo"));
+    assert!(harness.contains("RUSTUP_HOME"));
+    assert!(harness.contains("windowfocus --sync"));
+    assert!(!harness.contains("windowactivate"));
+    assert!(harness.contains("GIGATYPE_PASTE_KEYS=shift+insert"));
+    assert!(harness.contains("casefold"));
+    assert!(!harness.contains("xfce4-clipman"));
+    assert!(!workflow.contains("xfce4-clipman"));
+    let main = repo_file("src/main.rs");
+    assert!(main.contains("static DESKTOP_CLIPBOARD"));
+    assert!(main.contains("with_desktop_clipboard"));
+    for boundary in [
+        "bootstrap-model.sh",
+        "module-null-sink",
+        "example.wav",
+        "transcribe-file",
+        "toggle | grep -qx recording",
+        "xclip",
+        "editor-output",
+    ] {
+        assert!(harness.contains(boundary), "E2E omits {boundary}");
+    }
+
+    let readme = repo_file("README.md");
+    assert!(readme.contains("GitHub-hosted E2E"));
+    assert!(readme.contains("does not test a physical microphone or KDE Wayland"));
+}
+
+#[test]
+fn hosted_e2e_harness_refuses_self_hosted_and_developer_machines() {
+    let harness = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-hosted-e2e.sh");
+    let output = Command::new("bash")
+        .arg(harness)
+        .env("GITHUB_ACTIONS", "true")
+        .env("RUNNER_ENVIRONMENT", "self-hosted")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Refusing to run outside a GitHub-hosted runner"));
 }

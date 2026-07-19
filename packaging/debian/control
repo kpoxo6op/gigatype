@@ -1,0 +1,15 @@
+Source: gigatype
+Section: sound
+Priority: optional
+Maintainer: GigaType contributors <kpoxo6op@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, cmake, pkg-config, libasound2-dev, libssl-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/kpoxo6op/gigatype
+Rules-Requires-Root: no
+
+Package: gigatype
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, curl, ca-certificates
+Description: private local Russian voice typing with GigaAM v3
+ GigaType records from the system microphone, transcribes locally with the
+ GigaAM v3 RNN-T ONNX model, and inserts Russian text into the focused app.

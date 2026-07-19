@@ -1,16 +1,15 @@
 [Unit]
 Description=GigaType local Russian voice typing
-After=graphical-session.target pipewire.service
+After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/gigatype daemon
-ExecStopPost=/usr/bin/rm -f %t/gigatype-recording.wav
+ExecStopPost=/usr/bin/rm -f %t/gigatype-recording.wav %t/gigatype-transcribing
 Restart=on-failure
 RestartSec=2
-Environment=HF_HUB_OFFLINE=1
-Environment=HF_HOME=%h/.local/share/russian-asr/models
+Environment=GIGATYPE_MODEL=%h/.local/share/gigatype/models/gigaam-v3-e2e-rnnt
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

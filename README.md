@@ -2,40 +2,11 @@
 
 [![CI](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml/badge.svg)](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml)
 
-GigaType is a private, local Russian dictation app for KDE Plasma on Linux. Press `F9`, speak, press `F9` again, and the transcription is inserted into the focused app. Audio and text stay on the computer.
+GigaType is local Russian voice typing for Unix desktops. Press `F9`, speak, then press `F9` again to insert the transcription into the focused app.
 
-It uses a fast Rust desktop daemon and keeps [GigaAM v3 end-to-end RNN-T](https://huggingface.co/ai-sage/GigaAM-v3) warm in a persistent Python worker. The model supplies Russian punctuation, capitalization, and text normalization without reloading its weights for every sentence.
-
-## MVP features
-
-- system-wide push-to-talk toggle (`F9` by default) and safe cancel shortcut (`Shift+F9`)
-- short, distinct audio cues for “listening” and “transcribing”
-- direct insertion at the current cursor on KDE Wayland
-- lossless clipboard preservation, including images, files, HTML, and other MIME types
-- configurable `Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert` paste for GUI apps and terminals, with copy-only fallback when injection is unavailable
-- Russian spoken punctuation: `точка`, `запятая`, `вопросительный знак`, `восклицательный знак`, `двоеточие`, `точка с запятой`, `многоточие`, `новая строка`
-- model-native Russian punctuation, capitalization, number formatting, and text normalization
-- persistent local GigaAM worker and recordings longer than 25 seconds split safely
-- silence rejection, preferred-microphone fallback, and automatic media pause/resume
-- double-press protection, a two-minute recording ceiling, and private-audio cleanup on lock, suspend, stop, or restart
-- desktop notifications, cancel/status commands, transcript history, and a health check
-- automatic local model setup; no account or API token required
-- no network access during transcription
-
-## Requirements
-
-The current MVP targets KDE Plasma 6 on Wayland and Debian/Ubuntu-style Linux distributions. It needs approximately 2 GB for the CPU model and its isolated Python environment.
-
-Install the system packages first:
-
-```bash
-sudo apt install cargo rustfmt ffmpeg pipewire-bin qdbus-qt6 \
-  libglib2.0-bin libnotify-bin python3 python3-venv
-```
+It runs [GigaAM v3](https://huggingface.co/ai-sage/GigaAM-v3) on your computer. Dictation does not use a cloud API, account, token, or Python runtime.
 
 ## Install
-
-Clone and run the installer:
 
 ```bash
 git clone https://github.com/kpoxo6op/gigatype.git
@@ -43,71 +14,50 @@ cd gigatype
 ./scripts/install.sh
 ```
 
-On the first run, the installer creates an isolated Python environment and downloads the public `e2e_rnnt` revision of GigaAM v3. It then builds the release binary, starts a user service, registers `F9` only if the shortcut is free, and grants the installing user access to a narrowly scoped virtual keyboard device.
+The installer downloads the checked model files, builds GigaType, configures autostart, and requests any desktop permissions it needs.
 
-To inspect the model setup without changing anything:
+GigaType supports Linux on Wayland or X11, macOS, and BSD desktops running X11. Run this after installation to check your setup:
 
 ```bash
-./scripts/bootstrap-model.sh --print-plan
+gigatype doctor
 ```
 
 ## Use
 
-Press `F9` once to listen and again to stop, transcribe, and insert. Press `Shift+F9` to cancel and delete the current recording without transcribing it. Useful commands:
+- `F9`: start listening; press again to stop, transcribe, and insert
+- `Shift+F9`: cancel the current recording
+
+Useful commands:
 
 ```bash
-gigatype toggle
-gigatype cancel
 gigatype status
-gigatype doctor
+gigatype microphones
 gigatype transcribe-file recording.wav
+gigatype authorize
 ```
 
-History is stored at `~/.local/share/gigatype/history.jsonl`. Temporary microphone audio lives in the per-login runtime directory and is deleted immediately after every transcription attempt. Locking the desktop, suspending the laptop, cancelling, or stopping/restarting the service also removes an unfinished recording.
+On macOS, allow GigaType access to the microphone and Accessibility controls when prompted. Wayland permission is handled by `gigatype authorize` and the installer.
 
-The cues use the desktop's short FreeDesktop device-added/device-removed sounds. To turn them off, add `Environment=GIGATYPE_NO_SOUNDS=1` to a systemd user-service override. Custom `.oga`, `.ogg`, or `.wav` files can be selected with `GIGATYPE_START_SOUND` and `GIGATYPE_STOP_SOUND`.
+## Local data
 
-### Reliability settings
+- Model: `~/.local/share/gigatype/models/`
+- Transcript history: `~/.local/share/gigatype/history.jsonl`
+- Temporary audio: deleted after transcription or cancellation
 
-Settings are environment variables in a systemd user override (`systemctl --user edit gigatype.service`). Defaults work for normal KDE applications:
+The model is downloaded once. Normal dictation works offline.
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `GIGATYPE_PASTE_KEYS` | `ctrl+v` | Use `ctrl+shift+v` or `shift+insert` for a terminal-first setup |
-| `GIGATYPE_CLIPBOARD_RESTORE_MS` | `120` | Wait before restoring every original clipboard format |
-| `GIGATYPE_MAX_RECORDING_MS` | `120000` | Stop and transcribe automatically at the duration limit |
-| `GIGATYPE_DEBOUNCE_MS` | `300` | Ignore accidental duplicate shortcut presses |
-| `GIGATYPE_MICROPHONE` | system default | Preferred PipeWire node name or serial; falls back safely if unavailable or disconnected |
-| `GIGATYPE_SILENCE_RMS` | `80` | PCM energy threshold below which silent recordings skip transcription |
-| `GIGATYPE_KEEP_MEDIA_PLAYING` | unset | Set to `1` to disable MPRIS pause/resume |
+## Testing
 
-After changing an override, run `systemctl --user daemon-reload && systemctl --user restart gigatype.service`.
+GitHub-hosted E2E tests the real GigaAM model through a virtual microphone, checks that the beginning and end of the recording are preserved, inserts the result into a focused X11 editor, and verifies clipboard restoration.
 
-## Remove the app
+CI also holds a fake clipboard transfer open indefinitely and verifies that GigaType times out, inserts without preserving that clipboard, returns to idle, and accepts the next `F9`.
+
+It does not test a physical microphone or KDE Wayland. Those require an interactive machine.
+
+## Remove
 
 ```bash
 ./scripts/uninstall.sh
 ```
 
-The uninstall script deliberately keeps the separately installed GigaAM model.
-
-## Privacy and security
-
-- Transcription runs locally. The systemd service forces Hugging Face offline mode after installation.
-- Installation downloads Python packages and model files from PyPI, the official PyTorch CPU index, and Hugging Face. Normal dictation does not use the network.
-- Raw microphone audio is deleted immediately after each transcription attempt or cancellation.
-- Transcript history is plain JSON Lines stored with owner-only `0600` permissions. Delete it at any time if you do not want local history.
-- Direct insertion requires `/dev/uinput`. The installer adds a udev rule that grants only the installing user `0600` access, and the uninstaller removes that rule. Anyone able to replace the process running as that user could synthesize keyboard input, so review the installer before using it on a shared machine.
-- The model weights are downloaded during installation and are not distributed in this repository.
-
-## Scope
-
-This is an early Linux/KDE MVP. Packaging for other distributions, a settings UI, tray controls, non-KDE desktop support, and GPU/ONNX backends are future work rather than release blockers.
-
-## Architecture
-
-`gigatype daemon` owns a Unix control socket and the microphone state. `worker/gigaam_worker.py` loads GigaAM once and accepts one JSON request per line. The Rust process handles audio capture, formatting, KDE clipboard preservation, virtual-keyboard paste, notifications, and history.
-
-## License
-
-GigaType is released under the [MIT License](LICENSE). GigaAM Multilingual is a separate MIT-licensed model downloaded from its publisher at installation time.
+The uninstaller removes GigaType and its local services. It keeps the downloaded model so it does not need to be downloaded again if you reinstall.
