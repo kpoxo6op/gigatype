@@ -80,6 +80,13 @@ fn app_releases_use_consistent_titles_and_generated_notes() {
 }
 
 #[test]
+fn release_uses_supported_github_hosted_macos_runners() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    assert!(!workflow.contains("os: macos-13"));
+    assert!(workflow.contains("os: macos-15-intel"));
+}
+
+#[test]
 fn github_hosted_ci_runs_the_real_model_virtual_audio_x11_path() {
     let workflow = repo_file(".github/workflows/ci.yml");
     assert!(workflow.contains("hosted-e2e:"));
