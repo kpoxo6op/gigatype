@@ -345,14 +345,79 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<(), String> {
     writer.finalize().map_err(|error| error.to_string())
 }
 
-pub fn play_cue(listening: bool) -> Result<(), String> {
+fn default_output() -> Result<(cpal::Device, cpal::SupportedStreamConfig, String), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| "no default audio output is available".to_string())?;
+    let name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let supported = device
         .default_output_config()
         .map_err(|error| format!("could not read audio output format: {error}"))?;
+    Ok((device, supported, name))
+}
+
+pub fn output_report() -> Result<String, String> {
+    let (_, supported, name) = default_output()?;
+    Ok(format!(
+        "{name} ({} Hz, {} channel(s), {:?})",
+        supported.sample_rate(),
+        supported.channels(),
+        supported.sample_format()
+    ))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutputSampleFormat {
+    I8,
+    I16,
+    I24,
+    I32,
+    I64,
+    U8,
+    U16,
+    U24,
+    U32,
+    U64,
+    F32,
+    F64,
+}
+
+impl TryFrom<cpal::SampleFormat> for OutputSampleFormat {
+    type Error = String;
+
+    fn try_from(format: cpal::SampleFormat) -> Result<Self, Self::Error> {
+        match format {
+            cpal::SampleFormat::I8 => Ok(Self::I8),
+            cpal::SampleFormat::I16 => Ok(Self::I16),
+            cpal::SampleFormat::I24 => Ok(Self::I24),
+            cpal::SampleFormat::I32 => Ok(Self::I32),
+            cpal::SampleFormat::I64 => Ok(Self::I64),
+            cpal::SampleFormat::U8 => Ok(Self::U8),
+            cpal::SampleFormat::U16 => Ok(Self::U16),
+            cpal::SampleFormat::U24 => Ok(Self::U24),
+            cpal::SampleFormat::U32 => Ok(Self::U32),
+            cpal::SampleFormat::U64 => Ok(Self::U64),
+            cpal::SampleFormat::F32 => Ok(Self::F32),
+            cpal::SampleFormat::F64 => Ok(Self::F64),
+            format => Err(format!(
+                "unsupported audio output sample format: {format:?}"
+            )),
+        }
+    }
+}
+
+pub fn play_cue(listening: bool) -> Result<(), String> {
+    let (device, supported, name) = default_output()?;
+    eprintln!(
+        "GigaType audio output: {name} ({} Hz, {} channel(s), {:?})",
+        supported.sample_rate(),
+        supported.channels(),
+        supported.sample_format()
+    );
     let config = supported.config();
     let rate = config.sample_rate;
     let channels = config.channels as usize;
@@ -377,76 +442,41 @@ pub fn play_cue(listening: bool) -> Result<(), String> {
         .collect::<Vec<_>>();
     let duration = Duration::from_secs_f32(samples.len() as f32 / channels as f32 / rate as f32)
         + Duration::from_millis(20);
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => output_stream_f32(&device, config, samples)?,
-        cpal::SampleFormat::I16 => output_stream_i16(&device, config, samples)?,
-        cpal::SampleFormat::U16 => output_stream_u16(&device, config, samples)?,
-        format => {
-            return Err(format!(
-                "unsupported audio output sample format: {format:?}"
-            ))
-        }
+    let stream = match OutputSampleFormat::try_from(supported.sample_format())? {
+        OutputSampleFormat::I8 => output_stream::<i8>(&device, config, samples)?,
+        OutputSampleFormat::I16 => output_stream::<i16>(&device, config, samples)?,
+        OutputSampleFormat::I24 => output_stream::<cpal::I24>(&device, config, samples)?,
+        OutputSampleFormat::I32 => output_stream::<i32>(&device, config, samples)?,
+        OutputSampleFormat::I64 => output_stream::<i64>(&device, config, samples)?,
+        OutputSampleFormat::U8 => output_stream::<u8>(&device, config, samples)?,
+        OutputSampleFormat::U16 => output_stream::<u16>(&device, config, samples)?,
+        OutputSampleFormat::U24 => output_stream::<cpal::U24>(&device, config, samples)?,
+        OutputSampleFormat::U32 => output_stream::<u32>(&device, config, samples)?,
+        OutputSampleFormat::U64 => output_stream::<u64>(&device, config, samples)?,
+        OutputSampleFormat::F32 => output_stream::<f32>(&device, config, samples)?,
+        OutputSampleFormat::F64 => output_stream::<f64>(&device, config, samples)?,
     };
     stream.play().map_err(|error| error.to_string())?;
     std::thread::sleep(duration);
     Ok(())
 }
 
-fn output_stream_f32(
+fn output_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
     let mut index = 0;
     device
         .build_output_stream(
             config,
-            move |output: &mut [f32], _| {
-                for value in output {
-                    *value = samples.get(index).copied().unwrap_or(0.0);
-                    index += 1;
-                }
-            },
-            |error| eprintln!("GigaType sound output: {error}"),
-            None,
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn output_stream_i16(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
-    let mut index = 0;
-    device
-        .build_output_stream(
-            config,
-            move |output: &mut [i16], _| {
-                for value in output {
-                    *value = (samples.get(index).copied().unwrap_or(0.0) * i16::MAX as f32) as i16;
-                    index += 1;
-                }
-            },
-            |error| eprintln!("GigaType sound output: {error}"),
-            None,
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn output_stream_u16(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
-    let mut index = 0;
-    device
-        .build_output_stream(
-            config,
-            move |output: &mut [u16], _| {
+            move |output: &mut [T], _| {
                 for value in output {
                     let sample = samples.get(index).copied().unwrap_or(0.0);
-                    *value = ((sample * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                    *value = T::from_sample(sample);
                     index += 1;
                 }
             },
@@ -459,6 +489,28 @@ fn output_stream_u16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_numeric_output_format_has_a_playback_path_without_live_hardware() {
+        let formats = [
+            (cpal::SampleFormat::I8, OutputSampleFormat::I8),
+            (cpal::SampleFormat::I16, OutputSampleFormat::I16),
+            (cpal::SampleFormat::I24, OutputSampleFormat::I24),
+            (cpal::SampleFormat::I32, OutputSampleFormat::I32),
+            (cpal::SampleFormat::I64, OutputSampleFormat::I64),
+            (cpal::SampleFormat::U8, OutputSampleFormat::U8),
+            (cpal::SampleFormat::U16, OutputSampleFormat::U16),
+            (cpal::SampleFormat::U24, OutputSampleFormat::U24),
+            (cpal::SampleFormat::U32, OutputSampleFormat::U32),
+            (cpal::SampleFormat::U64, OutputSampleFormat::U64),
+            (cpal::SampleFormat::F32, OutputSampleFormat::F32),
+            (cpal::SampleFormat::F64, OutputSampleFormat::F64),
+        ];
+
+        for (format, expected) in formats {
+            assert_eq!(OutputSampleFormat::try_from(format).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn resampling_preserves_duration() {
