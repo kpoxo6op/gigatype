@@ -345,14 +345,39 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<(), String> {
     writer.finalize().map_err(|error| error.to_string())
 }
 
-pub fn play_cue(listening: bool) -> Result<(), String> {
+fn default_output() -> Result<(cpal::Device, cpal::SupportedStreamConfig, String), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| "no default audio output is available".to_string())?;
+    let name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let supported = device
         .default_output_config()
         .map_err(|error| format!("could not read audio output format: {error}"))?;
+    Ok((device, supported, name))
+}
+
+pub fn output_report() -> Result<String, String> {
+    let (_, supported, name) = default_output()?;
+    Ok(format!(
+        "{name} ({} Hz, {} channel(s), {:?})",
+        supported.sample_rate(),
+        supported.channels(),
+        supported.sample_format()
+    ))
+}
+
+pub fn play_cue(listening: bool) -> Result<(), String> {
+    let (device, supported, name) = default_output()?;
+    eprintln!(
+        "GigaType audio output: {name} ({} Hz, {} channel(s), {:?})",
+        supported.sample_rate(),
+        supported.channels(),
+        supported.sample_format()
+    );
     let config = supported.config();
     let rate = config.sample_rate;
     let channels = config.channels as usize;
@@ -378,9 +403,18 @@ pub fn play_cue(listening: bool) -> Result<(), String> {
     let duration = Duration::from_secs_f32(samples.len() as f32 / channels as f32 / rate as f32)
         + Duration::from_millis(20);
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => output_stream_f32(&device, config, samples)?,
-        cpal::SampleFormat::I16 => output_stream_i16(&device, config, samples)?,
-        cpal::SampleFormat::U16 => output_stream_u16(&device, config, samples)?,
+        cpal::SampleFormat::I8 => output_stream::<i8>(&device, config, samples)?,
+        cpal::SampleFormat::I16 => output_stream::<i16>(&device, config, samples)?,
+        cpal::SampleFormat::I24 => output_stream::<cpal::I24>(&device, config, samples)?,
+        cpal::SampleFormat::I32 => output_stream::<i32>(&device, config, samples)?,
+        cpal::SampleFormat::I64 => output_stream::<i64>(&device, config, samples)?,
+        cpal::SampleFormat::U8 => output_stream::<u8>(&device, config, samples)?,
+        cpal::SampleFormat::U16 => output_stream::<u16>(&device, config, samples)?,
+        cpal::SampleFormat::U24 => output_stream::<cpal::U24>(&device, config, samples)?,
+        cpal::SampleFormat::U32 => output_stream::<u32>(&device, config, samples)?,
+        cpal::SampleFormat::U64 => output_stream::<u64>(&device, config, samples)?,
+        cpal::SampleFormat::F32 => output_stream::<f32>(&device, config, samples)?,
+        cpal::SampleFormat::F64 => output_stream::<f64>(&device, config, samples)?,
         format => {
             return Err(format!(
                 "unsupported audio output sample format: {format:?}"
@@ -392,61 +426,22 @@ pub fn play_cue(listening: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn output_stream_f32(
+fn output_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
     let mut index = 0;
     device
         .build_output_stream(
             config,
-            move |output: &mut [f32], _| {
-                for value in output {
-                    *value = samples.get(index).copied().unwrap_or(0.0);
-                    index += 1;
-                }
-            },
-            |error| eprintln!("GigaType sound output: {error}"),
-            None,
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn output_stream_i16(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
-    let mut index = 0;
-    device
-        .build_output_stream(
-            config,
-            move |output: &mut [i16], _| {
-                for value in output {
-                    *value = (samples.get(index).copied().unwrap_or(0.0) * i16::MAX as f32) as i16;
-                    index += 1;
-                }
-            },
-            |error| eprintln!("GigaType sound output: {error}"),
-            None,
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn output_stream_u16(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    samples: Vec<f32>,
-) -> Result<cpal::Stream, String> {
-    let mut index = 0;
-    device
-        .build_output_stream(
-            config,
-            move |output: &mut [u16], _| {
+            move |output: &mut [T], _| {
                 for value in output {
                     let sample = samples.get(index).copied().unwrap_or(0.0);
-                    *value = ((sample * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                    *value = T::from_sample(sample);
                     index += 1;
                 }
             },
@@ -459,6 +454,16 @@ fn output_stream_u16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cue_plays_on_the_current_default_output_format() {
+        let host = cpal::default_host();
+        if host.default_output_device().is_none() {
+            return;
+        }
+
+        play_cue(true).expect("the current default output format should play the cue");
+    }
 
     #[test]
     fn resampling_preserves_duration() {

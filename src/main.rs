@@ -1211,6 +1211,11 @@ fn doctor() {
         cpal::default_host().id().name()
     );
 
+    match audio::output_report() {
+        Ok(report) => println!("✓ Audio output        {report}"),
+        Err(error) => println!("✗ Audio output        {error}"),
+    }
+
     let clipboard_ok = Command::new("qdbus6")
         .args([
             "org.kde.klipper",
