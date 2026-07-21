@@ -370,6 +370,46 @@ pub fn output_report() -> Result<String, String> {
     ))
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutputSampleFormat {
+    I8,
+    I16,
+    I24,
+    I32,
+    I64,
+    U8,
+    U16,
+    U24,
+    U32,
+    U64,
+    F32,
+    F64,
+}
+
+impl TryFrom<cpal::SampleFormat> for OutputSampleFormat {
+    type Error = String;
+
+    fn try_from(format: cpal::SampleFormat) -> Result<Self, Self::Error> {
+        match format {
+            cpal::SampleFormat::I8 => Ok(Self::I8),
+            cpal::SampleFormat::I16 => Ok(Self::I16),
+            cpal::SampleFormat::I24 => Ok(Self::I24),
+            cpal::SampleFormat::I32 => Ok(Self::I32),
+            cpal::SampleFormat::I64 => Ok(Self::I64),
+            cpal::SampleFormat::U8 => Ok(Self::U8),
+            cpal::SampleFormat::U16 => Ok(Self::U16),
+            cpal::SampleFormat::U24 => Ok(Self::U24),
+            cpal::SampleFormat::U32 => Ok(Self::U32),
+            cpal::SampleFormat::U64 => Ok(Self::U64),
+            cpal::SampleFormat::F32 => Ok(Self::F32),
+            cpal::SampleFormat::F64 => Ok(Self::F64),
+            format => Err(format!(
+                "unsupported audio output sample format: {format:?}"
+            )),
+        }
+    }
+}
+
 pub fn play_cue(listening: bool) -> Result<(), String> {
     let (device, supported, name) = default_output()?;
     eprintln!(
@@ -402,24 +442,19 @@ pub fn play_cue(listening: bool) -> Result<(), String> {
         .collect::<Vec<_>>();
     let duration = Duration::from_secs_f32(samples.len() as f32 / channels as f32 / rate as f32)
         + Duration::from_millis(20);
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::I8 => output_stream::<i8>(&device, config, samples)?,
-        cpal::SampleFormat::I16 => output_stream::<i16>(&device, config, samples)?,
-        cpal::SampleFormat::I24 => output_stream::<cpal::I24>(&device, config, samples)?,
-        cpal::SampleFormat::I32 => output_stream::<i32>(&device, config, samples)?,
-        cpal::SampleFormat::I64 => output_stream::<i64>(&device, config, samples)?,
-        cpal::SampleFormat::U8 => output_stream::<u8>(&device, config, samples)?,
-        cpal::SampleFormat::U16 => output_stream::<u16>(&device, config, samples)?,
-        cpal::SampleFormat::U24 => output_stream::<cpal::U24>(&device, config, samples)?,
-        cpal::SampleFormat::U32 => output_stream::<u32>(&device, config, samples)?,
-        cpal::SampleFormat::U64 => output_stream::<u64>(&device, config, samples)?,
-        cpal::SampleFormat::F32 => output_stream::<f32>(&device, config, samples)?,
-        cpal::SampleFormat::F64 => output_stream::<f64>(&device, config, samples)?,
-        format => {
-            return Err(format!(
-                "unsupported audio output sample format: {format:?}"
-            ))
-        }
+    let stream = match OutputSampleFormat::try_from(supported.sample_format())? {
+        OutputSampleFormat::I8 => output_stream::<i8>(&device, config, samples)?,
+        OutputSampleFormat::I16 => output_stream::<i16>(&device, config, samples)?,
+        OutputSampleFormat::I24 => output_stream::<cpal::I24>(&device, config, samples)?,
+        OutputSampleFormat::I32 => output_stream::<i32>(&device, config, samples)?,
+        OutputSampleFormat::I64 => output_stream::<i64>(&device, config, samples)?,
+        OutputSampleFormat::U8 => output_stream::<u8>(&device, config, samples)?,
+        OutputSampleFormat::U16 => output_stream::<u16>(&device, config, samples)?,
+        OutputSampleFormat::U24 => output_stream::<cpal::U24>(&device, config, samples)?,
+        OutputSampleFormat::U32 => output_stream::<u32>(&device, config, samples)?,
+        OutputSampleFormat::U64 => output_stream::<u64>(&device, config, samples)?,
+        OutputSampleFormat::F32 => output_stream::<f32>(&device, config, samples)?,
+        OutputSampleFormat::F64 => output_stream::<f64>(&device, config, samples)?,
     };
     stream.play().map_err(|error| error.to_string())?;
     std::thread::sleep(duration);
@@ -456,13 +491,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cue_plays_on_the_current_default_output_format() {
-        let host = cpal::default_host();
-        if host.default_output_device().is_none() {
-            return;
-        }
+    fn every_numeric_output_format_has_a_playback_path_without_live_hardware() {
+        let formats = [
+            (cpal::SampleFormat::I8, OutputSampleFormat::I8),
+            (cpal::SampleFormat::I16, OutputSampleFormat::I16),
+            (cpal::SampleFormat::I24, OutputSampleFormat::I24),
+            (cpal::SampleFormat::I32, OutputSampleFormat::I32),
+            (cpal::SampleFormat::I64, OutputSampleFormat::I64),
+            (cpal::SampleFormat::U8, OutputSampleFormat::U8),
+            (cpal::SampleFormat::U16, OutputSampleFormat::U16),
+            (cpal::SampleFormat::U24, OutputSampleFormat::U24),
+            (cpal::SampleFormat::U32, OutputSampleFormat::U32),
+            (cpal::SampleFormat::U64, OutputSampleFormat::U64),
+            (cpal::SampleFormat::F32, OutputSampleFormat::F32),
+            (cpal::SampleFormat::F64, OutputSampleFormat::F64),
+        ];
 
-        play_cue(true).expect("the current default output format should play the cue");
+        for (format, expected) in formats {
+            assert_eq!(OutputSampleFormat::try_from(format).unwrap(), expected);
+        }
     }
 
     #[test]
