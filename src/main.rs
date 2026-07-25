@@ -537,18 +537,39 @@ fn audio_has_speech(audio_path: &Path) -> Result<bool, String> {
     let mut squared = 0_f64;
     let mut loud_samples = 0_usize;
     let mut sample_count = 0_usize;
+    let mut frame_squared = 0_f64;
+    let mut frame_loud_samples = 0_usize;
+    let mut frame_sample_count = 0_usize;
+    let mut consecutive_voiced_frames = 0_usize;
+    let mut longest_voice_run = 0_usize;
+    const FRAME_SAMPLES: usize = 1_600;
     for sample in data.chunks_exact(2) {
         let value = i16::from_le_bytes([sample[0], sample[1]]) as f64;
         squared += value * value;
+        frame_squared += value * value;
         if value.abs() >= threshold * 4.0 {
             loud_samples += 1;
+            frame_loud_samples += 1;
         }
         sample_count += 1;
+        frame_sample_count += 1;
+        if frame_sample_count == FRAME_SAMPLES {
+            let frame_rms = (frame_squared / frame_sample_count as f64).sqrt();
+            if frame_rms >= threshold && frame_loud_samples * 20 >= frame_sample_count {
+                consecutive_voiced_frames += 1;
+                longest_voice_run = longest_voice_run.max(consecutive_voiced_frames);
+            } else {
+                consecutive_voiced_frames = 0;
+            }
+            frame_squared = 0.0;
+            frame_loud_samples = 0;
+            frame_sample_count = 0;
+        }
     }
     let rms = (squared / sample_count as f64).sqrt();
-    let has_speech = rms >= threshold && loud_samples * 200 >= sample_count;
+    let has_speech = longest_voice_run >= 2;
     eprintln!(
-        "GigaType audio: rms={rms:.2}, threshold={threshold:.2}, loud_samples={loud_samples}/{sample_count}, speech={has_speech}"
+        "GigaType audio: rms={rms:.2}, threshold={threshold:.2}, loud_samples={loud_samples}/{sample_count}, longest_voice_run={longest_voice_run}, speech={has_speech}"
     );
     Ok(has_speech)
 }
@@ -1707,6 +1728,39 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(file.path(), wav(&samples)).unwrap();
         assert!(audio_has_speech(file.path()).unwrap());
+    }
+
+    #[test]
+    fn quiet_speech_with_long_pauses_is_sent_to_the_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut samples = vec![0; 16_000 * 16];
+        for (index, sample) in samples[80_000..84_800].iter_mut().enumerate() {
+            *sample = if index % 2 == 0 { 400 } else { -400 };
+        }
+        fs::write(file.path(), wav(&samples)).unwrap();
+        assert!(audio_has_speech(file.path()).unwrap());
+    }
+
+    #[test]
+    fn an_isolated_click_is_not_sent_to_the_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut samples = vec![0; 16_000];
+        samples[8_000] = 10_000;
+        fs::write(file.path(), wav(&samples)).unwrap();
+        assert!(!audio_has_speech(file.path()).unwrap());
+    }
+
+    #[test]
+    fn separated_noise_bursts_are_not_sent_to_the_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut samples = vec![0; 16_000];
+        for start in [8_000, 12_800] {
+            for (index, sample) in samples[start..start + 80].iter_mut().enumerate() {
+                *sample = if index % 2 == 0 { 2_000 } else { -2_000 };
+            }
+        }
+        fs::write(file.path(), wav(&samples)).unwrap();
+        assert!(!audio_has_speech(file.path()).unwrap());
     }
 
     #[cfg(target_os = "linux")]
